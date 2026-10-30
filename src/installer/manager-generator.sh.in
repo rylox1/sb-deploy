@@ -1,0 +1,29 @@
+create_manager() {
+# -----------------------
+# 创建 sb 管理脚本
+MANAGER_PATH="$CONFIG_DIR/sb-manager.sh"
+info "正在创建 sb 管理面板: $SB_PATH"
+
+cat > "$MANAGER_PATH" <<'SB_SCRIPT'
+@@BUILD:MANAGER_CONTENT@@
+SB_SCRIPT
+
+chmod +x "$MANAGER_PATH"
+mkdir -p "$(dirname "$SB_PATH")"
+{
+    printf '#!/usr/bin/env bash\n'
+    printf 'export SINGBOX_DEPLOY_MODE=%q\n' "$DEPLOY_MODE"
+    printf 'export SINGBOX_CONFIG_DIR=%q\n' "$CONFIG_DIR"
+    printf 'export SINGBOX_ENTRY_PATH=%q\n' "$SB_PATH"
+    printf 'export SINGBOX_NODE_NAME_FILE=%q\n' "$NODE_NAME_FILE"
+    printf 'exec %q "$@"\n' "$MANAGER_PATH"
+} > "$SB_PATH"
+chmod +x "$SB_PATH"
+
+if [ "$DEPLOY_MODE" = "host" ]; then
+    ln -sf /usr/local/bin/sb /usr/bin/sb
+else
+    info "Docker 模式不修改系统 PATH；请按提示使用本地 sb 管理面板"
+fi
+info "✅ 管理面板已创建: $SB_PATH"
+}

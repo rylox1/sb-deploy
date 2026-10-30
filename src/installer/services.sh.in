@@ -1,0 +1,153 @@
+create_docker_compose_helper() {
+    cat > "$CONFIG_DIR/docker-compose-refresh.sh" <<'COMPOSE_REFRESH'
+@@BUILD:DOCKER_COMPOSE_TEMPLATE@@
+COMPOSE_REFRESH
+    chmod 700 "$CONFIG_DIR/docker-compose-refresh.sh"
+}
+
+# -----------------------
+# 设置服务
+setup_service() {
+    if [ "$DEPLOY_MODE" = "docker" ]; then
+        info "配置 Docker Compose 服务..."
+        create_docker_compose_helper
+        "$CONFIG_DIR/docker-compose-refresh.sh"
+        SERVICE_PATH="$CONFIG_DIR/docker-compose.yml"
+        docker_compose up -d || {
+            err "Docker 容器启动失败"
+            docker_compose logs --tail 30 || true
+            exit 1
+        }
+        sleep 2
+        local container_id
+        container_id="$(docker_compose ps -q sing-box)"
+        if [ -n "$container_id" ] && [ "$(docker inspect -f '{{.State.Running}}' "$container_id" 2>/dev/null || true)" = "true" ]; then
+            info "✅ Docker 容器已启动"
+        else
+            err "Docker 容器状态异常"
+            docker_compose logs --tail 30 || true
+            exit 1
+        fi
+        info "服务配置完成: $SERVICE_PATH"
+        return 0
+    fi
+
+    info "配置系统服务..."
+
+    if [ "$OS" = "alpine" ]; then
+        SERVICE_PATH="/etc/init.d/sing-box"
+        local output_log_path="/dev/null"
+        local error_log_path="/dev/null"
+        if [ "$LOG_ENABLED" = "true" ]; then
+            output_log_path="/var/log/sing-box.log"
+            error_log_path="/var/log/sing-box.err"
+        fi
+
+        cat > "$SERVICE_PATH" <<'OPENRC'
+#!/sbin/openrc-run
+
+name="sing-box"
+description="Sing-box Proxy Server"
+command="/usr/bin/sing-box"
+command_args="run -c /etc/sing-box/config.json"
+pidfile="/run/${RC_SVCNAME}.pid"
+command_background="yes"
+output_log="__OPENRC_OUTPUT_LOG__"
+error_log="__OPENRC_ERROR_LOG__"
+# 自动拉起（程序崩溃、OOM、被 kill 后自动恢复）
+supervisor=supervise-daemon
+supervise_daemon_args="--respawn-max 0 --respawn-delay 5"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    checkpath --directory --mode 0755 /var/log
+    checkpath --directory --mode 0755 /run
+}
+OPENRC
+        sed -i "s|__OPENRC_OUTPUT_LOG__|$output_log_path|;s|__OPENRC_ERROR_LOG__|$error_log_path|" "$SERVICE_PATH"
+
+        chmod +x "$SERVICE_PATH"
+        rc-update add sing-box default >/dev/null 2>&1 || warn "添加开机自启失败"
+        rc-service sing-box restart || {
+            err "服务启动失败"
+            if [ "$LOG_ENABLED" = "true" ]; then
+                tail -20 /var/log/sing-box.err 2>/dev/null || tail -20 /var/log/sing-box.log 2>/dev/null || true
+            else
+                warn "当前日志已关闭，请重新运行安装器并开启日志后排查服务错误"
+            fi
+            exit 1
+        }
+
+        sleep 2
+        if rc-service sing-box status >/dev/null 2>&1; then
+            info "✅ OpenRC 服务已启动"
+        else
+            err "服务状态异常"
+            exit 1
+        fi
+
+    else
+        SERVICE_PATH="/etc/systemd/system/sing-box.service"
+        local systemd_stdout="null"
+        local systemd_stderr="null"
+        if [ "$LOG_ENABLED" = "true" ]; then
+            systemd_stdout="journal"
+            systemd_stderr="journal"
+        fi
+
+        cat > "$SERVICE_PATH" <<'SYSTEMD'
+[Unit]
+Description=Sing-box Proxy Server
+Documentation=https://sing-box.sagernet.org
+After=network.target nss-lookup.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/etc/sing-box
+ExecStart=/usr/bin/sing-box run -c /etc/sing-box/config.json
+StandardOutput=__SYSTEMD_STDOUT__
+StandardError=__SYSTEMD_STDERR__
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=10s
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+SYSTEMD
+        sed -i "s|__SYSTEMD_STDOUT__|$systemd_stdout|;s|__SYSTEMD_STDERR__|$systemd_stderr|" "$SERVICE_PATH"
+
+        systemctl daemon-reload
+        systemctl enable sing-box >/dev/null 2>&1
+        systemctl restart sing-box || {
+            err "服务启动失败"
+            if [ "$LOG_ENABLED" = "true" ]; then
+                journalctl -u sing-box -n 30 --no-pager
+            else
+                warn "当前日志已关闭，请重新运行安装器并开启日志后排查服务错误"
+            fi
+            exit 1
+        }
+
+        sleep 2
+        if systemctl is-active sing-box >/dev/null 2>&1; then
+            info "✅ Systemd 服务已启动"
+        else
+            err "服务状态异常"
+            exit 1
+        fi
+    fi
+
+    info "服务配置完成: $SERVICE_PATH"
+}
+
+setup_service
+
+# -----------------------
+# 获取公网 IP

@@ -1,0 +1,41 @@
+main() {
+select_deploy_mode "${1:-}"
+
+    if [ -f "$CONFIG_PATH" ]; then
+        echo "检测到已有 sing-box 配置: $CONFIG_PATH"
+        echo "1) 安全更新管理器并调整协议（默认）"
+        echo "2) 明确重新安装并重建配置"
+        read -r -p "请选择 [1/2，默认 1]: " existing_choice || existing_choice=""
+        case "$existing_choice" in
+            ""|1)
+                for command_name in bash jq openssl; do
+                    command -v "$command_name" >/dev/null 2>&1 || { err "安全更新缺少依赖: $command_name"; return 1; }
+                done
+                if [ "$DEPLOY_MODE" = "host" ]; then
+                    [ "$(id -u)" = "0" ] || { err "主机安装模式需要 root 权限"; return 1; }
+                    command -v sing-box >/dev/null 2>&1 || { err "未找到 sing-box，不能安全校验配置"; return 1; }
+                else
+                    for command_name in docker; do
+                        command -v "$command_name" >/dev/null 2>&1 || { err "Docker 模式缺少依赖: $command_name"; return 1; }
+                    done
+                    docker compose version >/dev/null 2>&1 || { command -v docker-compose >/dev/null 2>&1 || { err "未找到 Docker Compose"; return 1; }; }
+                    docker info >/dev/null 2>&1 || { err "当前用户无法访问 Docker daemon"; return 1; }
+                    docker image inspect "$SINGBOX_IMAGE" >/dev/null 2>&1 || { err "本地缺少 sing-box 镜像，安全更新路径不会拉取镜像；请先明确执行镜像更新"; return 1; }
+                fi
+                create_manager
+                "$SB_PATH" --manage-protocols
+                return $?
+                ;;
+            2) ;;
+            *) err "无效选择，未修改节点"; return 1 ;;
+        esac
+    fi
+
+@@BUILD:INSTALLER_DEPENDENCIES@@
+@@BUILD:INSTALLER_INPUTS@@
+@@BUILD:INSTALLER_BINARY@@
+@@BUILD:INSTALLER_CONFIG@@
+@@BUILD:INSTALLER_SERVICES@@
+@@BUILD:INSTALLER_LINKS@@
+}
+

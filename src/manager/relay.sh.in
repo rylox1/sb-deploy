@@ -1,0 +1,74 @@
+action_generate_relay() {
+    read_config || return 1
+
+    local relay_log_disabled=true
+    local relay_output_log="/dev/null"
+    local relay_error_log="/dev/null"
+    local relay_systemd_stdout="null"
+    local relay_systemd_stderr="null"
+    if [ "$LOG_ENABLED" = "true" ]; then
+        relay_log_disabled=false
+        relay_output_log="/var/log/sing-box.log"
+        relay_error_log="/var/log/sing-box.err"
+        relay_systemd_stdout="journal"
+        relay_systemd_stderr="journal"
+    fi
+
+    if [ "${ENABLE_SS:-false}" != "true" ]; then
+        err "未检测到 SS 协议，请先通过管理面板的‘调整协议’启用 SS"
+        return 1
+    fi
+    read_config || return 1
+
+    # 线路机模板使用 CUSTOM_IP（若设置）或当前公共 IP
+    if [ -n "${CUSTOM_IP:-}" ]; then
+        INBOUND_IP="${CUSTOM_IP}"
+    else
+        INBOUND_IP="$(get_public_ip)"
+    fi
+
+    PUBLIC_IP="$INBOUND_IP"
+    RELAY_SCRIPT="/tmp/relay-install.sh"
+
+    info "正在生成线路机脚本: $RELAY_SCRIPT"
+
+    cat > "$RELAY_SCRIPT" <<'RELAY_EOF'
+#!/usr/bin/env bash
+@@BUILD:RELAY_TEMPLATE@@
+RELAY_EOF
+
+    # 替换占位符（INBOUND_IP/PORT/METHOD/PASSWORD 同时替换 REALITY_SNI）
+    sed -i "s|__INBOUND_IP__|$INBOUND_IP|g" "$RELAY_SCRIPT"
+    sed -i "s|__INBOUND_PORT__|$SS_PORT|g" "$RELAY_SCRIPT"
+    sed -i "s|__INBOUND_METHOD__|$SS_METHOD|g" "$RELAY_SCRIPT"
+    sed -i "s|__INBOUND_PASSWORD__|$SS_PSK|g" "$RELAY_SCRIPT"
+    sed -i "s|__REALITY_SNI__|${REALITY_SNI:-addons.mozilla.org}|g" "$RELAY_SCRIPT"
+    sed -i "s|__RELAY_LOG_DISABLED__|$relay_log_disabled|g" "$RELAY_SCRIPT"
+    sed -i "s|__RELAY_OPENRC_OUTPUT_LOG__|$relay_output_log|g" "$RELAY_SCRIPT"
+    sed -i "s|__RELAY_OPENRC_ERROR_LOG__|$relay_error_log|g" "$RELAY_SCRIPT"
+    sed -i "s|__RELAY_SYSTEMD_STDOUT__|$relay_systemd_stdout|g" "$RELAY_SCRIPT"
+    sed -i "s|__RELAY_SYSTEMD_STDERR__|$relay_systemd_stderr|g" "$RELAY_SCRIPT"
+
+    chmod +x "$RELAY_SCRIPT"
+
+    info "✅ 线路机脚本已生成: $RELAY_SCRIPT"
+    if [ "$LOG_ENABLED" = "true" ]; then
+        info "线路机运行日志: 已开启"
+    else
+        info "线路机运行日志: 已关闭；如需开启，请重新启用后生成线路机脚本"
+    fi
+    echo ""
+    info "请复制以下内容到线路机执行:"
+    echo "----------------------------------------"
+    cat "$RELAY_SCRIPT"
+    echo "----------------------------------------"
+    echo ""
+    info "在线路机执行命令示例："
+    echo "   nano /tmp/relay-install.sh 保存后执行"
+    echo "   chmod +x /tmp/relay-install.sh && bash /tmp/relay-install.sh"
+    echo ""
+    info "复制执行完成后，即可在线路机完成 sing-box 中转节点部署。"
+}
+
+# 协议调整功能
+# 协议元数据由编号统一映射，端口冲突按传输层判定。
