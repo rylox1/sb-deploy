@@ -5,10 +5,88 @@ COMPOSE_REFRESH
     chmod 700 "$CONFIG_DIR/docker-compose-refresh.sh"
 }
 
+hy2_hopping_helper_path() { printf '%s/hy2-port-hopping.sh\n' "$CONFIG_DIR"; }
+hy2_hopping_openrc_path() { printf '/etc/init.d/sb-deploy-hy2-hopping\n'; }
+hy2_hopping_systemd_path() { printf '/etc/systemd/system/sb-deploy-hy2-hopping.service\n'; }
+hy2_hopping_runlevel_path() { printf '/etc/runlevels/default/sb-deploy-hy2-hopping\n'; }
+
+cleanup_hy2_hopping_runtime() {
+    local force_table="${1:-false}" helper openrc unit runlevel active=false failed=false enabled=false unit_removed=false
+    helper=$(hy2_hopping_helper_path)
+    openrc=$(hy2_hopping_openrc_path)
+    unit=$(hy2_hopping_systemd_path)
+    runlevel=$(hy2_hopping_runlevel_path)
+
+    if [ "$OS" = alpine ]; then
+        if [ ! -e "$helper" ] && [ ! -e "$openrc" ] && [ ! -L "$runlevel" ]; then
+            return 0
+        fi
+        if [ -e "$openrc" ] && rc-service sb-deploy-hy2-hopping status >/dev/null 2>&1; then
+            active=true
+            rc-service sb-deploy-hy2-hopping stop || failed=true
+        fi
+    else
+        systemctl is-enabled --quiet sb-deploy-hy2-hopping.service && enabled=true
+        if [ ! -e "$helper" ] && [ ! -e "$unit" ] && [ "$enabled" = false ]; then
+            return 0
+        fi
+        if [ -e "$unit" ]; then
+            if systemctl is-active --quiet sb-deploy-hy2-hopping.service; then active=true; fi
+            systemctl stop sb-deploy-hy2-hopping.service || failed=true
+        fi
+    fi
+
+    if [ "$failed" = false ] && { [ "$force_table" = true ] || [ "$active" = true ]; } && [ -f "$helper" ] && [ -x "$helper" ]; then
+        "$helper" clear || failed=true
+    fi
+    if [ "$failed" = false ]; then
+        if [ "$OS" = alpine ] && [ -L "$runlevel" ]; then
+            rc-update del sb-deploy-hy2-hopping default >/dev/null 2>&1 || failed=true
+        elif [ "$OS" != alpine ] && { [ "$enabled" = true ] || [ -e "$unit" ]; }; then
+            systemctl disable sb-deploy-hy2-hopping.service >/dev/null 2>&1 || failed=true
+        fi
+    fi
+    if [ "$failed" = false ]; then
+        if [ "$OS" = alpine ]; then
+            rm -f "$openrc" "$helper" "$runlevel" || failed=true
+        else
+            if [ -e "$unit" ]; then
+                rm -f "$unit" || failed=true
+                [ ! -e "$unit" ] && unit_removed=true
+            fi
+            rm -f "$helper" || failed=true
+        fi
+    fi
+    if [ "$OS" != alpine ] && [ "$unit_removed" = true ]; then
+        systemctl daemon-reload || failed=true
+    fi
+    if [ "$failed" = true ]; then
+        err "清理 HY2 跳跃运行时失败；请人工检查 sb-deploy-hy2-hopping 服务及 inet sb_deploy_hy2 表"
+        return 1
+    fi
+    return 0
+}
+
+rollback_hy2_hopping_runtime() {
+    cleanup_hy2_hopping_runtime true || { err "HY2 跳跃运行时回滚不完整"; return 1; }
+}
+
 setup_hy2_hopping_runtime() {
-    [ "$DEPLOY_MODE" = host ] && [ "${ENABLE_HY2:-false}" = true ] && [ "${HY2_HOPPING_ENABLED:-false}" = true ] || return 0
-    command -v nft >/dev/null 2>&1 || { err "HY2 端口跳跃需要 nftables"; exit 1; }
-    cat > "$CONFIG_DIR/hy2-port-hopping.sh" <<'HOPPING_SCRIPT'
+    [ "$DEPLOY_MODE" = host ] || return 0
+    if [ "${ENABLE_HY2:-false}" != true ] || [ "${HY2_HOPPING_ENABLED:-false}" != true ]; then
+        cleanup_hy2_hopping_runtime false
+        return $?
+    fi
+    HY2_HOPPING_FORWARD_MODE=$(normalize_hy2_forward_mode "${HY2_HOPPING_FORWARD_MODE:-}" true host) || return 1
+    if [ "$HY2_HOPPING_FORWARD_MODE" = external ]; then
+        cleanup_hy2_hopping_runtime false
+        return $?
+    fi
+    probe_nftables_access || { err "HY2 nftables 不可用，未创建跳跃运行时"; return 1; }
+    local helper openrc unit
+    helper=$(hy2_hopping_helper_path); openrc=$(hy2_hopping_openrc_path); unit=$(hy2_hopping_systemd_path)
+
+    cat > "$helper" <<'HOPPING_SCRIPT' || { rollback_hy2_hopping_runtime; return 1; }
 #!/usr/bin/env bash
 set -euo pipefail
 CONFIG_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -48,9 +126,9 @@ case "${1:-}" in
   *) exit 2 ;;
 esac
 HOPPING_SCRIPT
-    chmod 700 "$CONFIG_DIR/hy2-port-hopping.sh"
+    chmod 700 "$helper" || { rollback_hy2_hopping_runtime; return 1; }
     if [ "$OS" = alpine ]; then
-        cat > /etc/init.d/sb-deploy-hy2-hopping <<'OPENRC_HOP'
+        cat > "$openrc" <<'OPENRC_HOP' || { rollback_hy2_hopping_runtime; return 1; }
 #!/sbin/openrc-run
 name="sb-deploy-hy2-hopping"
 command="/etc/sing-box/hy2-port-hopping.sh"
@@ -58,11 +136,11 @@ depend() { need net; before sing-box; }
 start() { "$command" apply; }
 stop() { "$command" clear; }
 OPENRC_HOP
-        chmod +x /etc/init.d/sb-deploy-hy2-hopping
-        rc-update add sb-deploy-hy2-hopping default >/dev/null 2>&1 || true
-        rc-service sb-deploy-hy2-hopping start || { err "HY2 nftables 规则启动失败"; exit 1; }
+        chmod +x "$openrc" || { rollback_hy2_hopping_runtime; return 1; }
+        rc-update add sb-deploy-hy2-hopping default >/dev/null 2>&1 || { rollback_hy2_hopping_runtime; return 1; }
+        rc-service sb-deploy-hy2-hopping start || { rollback_hy2_hopping_runtime; return 1; }
     else
-        cat > /etc/systemd/system/sb-deploy-hy2-hopping.service <<'SYSTEMD_HOP'
+        cat > "$unit" <<'SYSTEMD_HOP' || { rollback_hy2_hopping_runtime; return 1; }
 [Unit]
 Description=sb-deploy HY2 UDP port hopping
 Before=sing-box.service
@@ -74,10 +152,11 @@ ExecStop=/etc/sing-box/hy2-port-hopping.sh clear
 [Install]
 WantedBy=multi-user.target
 SYSTEMD_HOP
-        systemctl daemon-reload
-        systemctl enable sb-deploy-hy2-hopping.service >/dev/null 2>&1
-        systemctl restart sb-deploy-hy2-hopping.service || { err "HY2 nftables 规则启动失败"; exit 1; }
+        systemctl daemon-reload || { rollback_hy2_hopping_runtime; return 1; }
+        systemctl enable sb-deploy-hy2-hopping.service >/dev/null 2>&1 || { rollback_hy2_hopping_runtime; return 1; }
+        systemctl restart sb-deploy-hy2-hopping.service || { rollback_hy2_hopping_runtime; return 1; }
     fi
+    return 0
 }
 
 # -----------------------

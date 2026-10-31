@@ -1,4 +1,11 @@
 create_config() {
+    if [ "$DEPLOY_MODE" = host ] && $ENABLE_HY2; then
+        HY2_HOPPING_FORWARD_MODE=$(normalize_hy2_forward_mode "${HY2_HOPPING_FORWARD_MODE:-}" "${HY2_HOPPING_ENABLED:-false}" host) || exit 1
+        if [ "$HY2_HOPPING_FORWARD_MODE" = nftables ] && ! probe_nftables_access; then
+            err "当前环境无法管理 nftables，未写入节点配置"
+            exit 1
+        fi
+    fi
     info "生成配置文件: $CONFIG_PATH"
 
     mkdir -p "$(dirname "$CONFIG_PATH")"
@@ -258,6 +265,9 @@ HY2_BRUTAL_ENABLED=${HY2_BRUTAL_ENABLED:-false}
 HY2_CLIENT_UP_MBPS=${HY2_CLIENT_UP_MBPS:-}
 HY2_CLIENT_DOWN_MBPS=${HY2_CLIENT_DOWN_MBPS:-}
 CACHEEOF
+    if [ "$DEPLOY_MODE" = host ] && $ENABLE_HY2; then
+        printf 'HY2_HOPPING_FORWARD_MODE=%s\n' "${HY2_HOPPING_FORWARD_MODE:-}" >> "$CACHE_FILE"
+    fi
 
     $ENABLE_TUIC && cat >> "$CACHE_FILE" <<CACHEEOF
 TUIC_PORT=$PORT_TUIC

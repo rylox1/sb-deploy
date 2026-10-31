@@ -8,6 +8,7 @@ read_config() {
     CUSTOM_IP=""
     LOG_ENABLED="false"
     HY2_HOPPING_ENABLED=false; HY2_HOP_START=""; HY2_HOP_END=""; HY2_HOP_INTERVAL=15
+    HY2_HOPPING_FORWARD_MODE=""; HY2_HOPPING_FORWARD_MODE_LEGACY=false
     HY2_BRUTAL_ENABLED=false; HY2_CLIENT_UP_MBPS=""; HY2_CLIENT_DOWN_MBPS=""; HY2_LEGACY_CONGESTION=false
     if [ -f "$CACHE_FILE" ]; then
         . "$CACHE_FILE"
@@ -59,8 +60,18 @@ read_config() {
                 validate_hy2_hopping_settings "$HY2_HOP_START" "$HY2_HOP_END" "$HY2_HOP_INTERVAL" "$HY2_PORT" || return 1
                 HY2_HOP_START=$((10#$HY2_HOP_START)); HY2_HOP_END=$((10#$HY2_HOP_END)); HY2_HOP_INTERVAL=$((10#$HY2_HOP_INTERVAL))
                 validate_hy2_port_conflicts "$CONFIG_PATH" "$HY2_HOP_START" "$HY2_HOP_END" || return 1
+                if [ "$DEPLOY_MODE" = host ]; then
+                    if [ -z "${HY2_HOPPING_FORWARD_MODE:-}" ]; then HY2_HOPPING_FORWARD_MODE_LEGACY=true; fi
+                    HY2_HOPPING_FORWARD_MODE=$(normalize_hy2_forward_mode "${HY2_HOPPING_FORWARD_MODE:-}" true host) || return 1
+                else
+                    HY2_HOPPING_FORWARD_MODE=""
+                    HY2_HOPPING_FORWARD_MODE_LEGACY=false
+                fi
                 ;;
-            false) HY2_HOP_START=""; HY2_HOP_END="" ;;
+            false)
+                HY2_HOP_START=""; HY2_HOP_END=""; HY2_HOPPING_FORWARD_MODE=""
+                HY2_HOPPING_FORWARD_MODE_LEGACY=false
+                ;;
             *) err 'HY2_HOPPING_ENABLED 缓存值无效'; return 1 ;;
         esac
         [[ "$HY2_HOP_INTERVAL" =~ ^[0-9]+$ ]] || { err 'HY2_HOP_INTERVAL 缓存值无效'; return 1; }
@@ -190,6 +201,13 @@ generate_uris() {
         echo '' >> "$uri_tmp" || { rm -f "$uri_tmp"; return 1; }
         echo '=== Hysteria2 Mihomo / mihomo-kit 扩展 URI（非官方扩展） ===' >> "$uri_tmp" || { rm -f "$uri_tmp"; return 1; }
         echo "hy2://${hy2_encoded}@${hy2_host}:${hy2_authority_port}/?sni=www.bing.com&alpn=h3&insecure=1${hy2_mihomo_query}#${hy2_fragment}" >> "$uri_tmp" || { rm -f "$uri_tmp"; return 1; }
+        if [ "$DEPLOY_MODE" = host ] && [ "$HY2_HOPPING_ENABLED" = true ] && [ "$HY2_HOPPING_FORWARD_MODE" = external ]; then
+            echo '' >> "$uri_tmp" || { rm -f "$uri_tmp"; return 1; }
+            echo '# 外部转发契约：UDP '"$HY2_HOP_START-$HY2_HOP_END"' -> 容器 UDP '"$HY2_HOP_START" >> "$uri_tmp" || { rm -f "$uri_tmp"; return 1; }
+            echo '# 配置整个 UDP 范围到单端口，或逐个外部 UDP 端口映射到容器 UDP '"$HY2_HOP_START"'。' >> "$uri_tmp" || { rm -f "$uri_tmp"; return 1; }
+            echo '# 不要使用 '"$HY2_HOP_START-$HY2_HOP_END:$HY2_HOP_START-$HY2_HOP_END/udp"' 一对一映射；范围内只有首端在容器中监听。' >> "$uri_tmp" || { rm -f "$uri_tmp"; return 1; }
+            echo '# 脚本无法验证宿主机规则，请从容器外测试范围首端、中间端和末端。' >> "$uri_tmp" || { rm -f "$uri_tmp"; return 1; }
+        fi
         echo '' >> "$uri_tmp" || { rm -f "$uri_tmp"; return 1; }
     fi
 

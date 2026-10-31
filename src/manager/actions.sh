@@ -67,12 +67,13 @@ action_reset_ss() {
 action_configure_hy2() {
     read_config || return 1
     [ "${ENABLE_HY2:-false}" = true ] || { err 'HY2 协议未启用'; return 1; }
-    local new_port candidate previous_hopping="${HY2_HOPPING_ENABLED:-false}"
+    local new_port candidate
     read -r -p "输入 HY2 固定端口或跳跃范围首端（回车保持 ${HY2_PORT}）:" new_port || new_port=
     new_port=${new_port:-$HY2_PORT}
     validate_port "$new_port" || return 1
     collect_hy2_settings "$new_port" || return 1
-    validate_hy2_runtime_prerequisites "$previous_hopping" || return 1
+    [ "${HY2_SETTINGS_CANCELLED:-false}" = false ] || return 0
+    validate_hy2_runtime_prerequisites || return 1
     candidate=$(mktemp "$CONFIG_DIR/.hy2-configure.XXXXXX") || return 1
     jq --argjson port "$HY2_PORT" --argjson brutal "$HY2_BRUTAL_ENABLED" --argjson up "${HY2_CLIENT_DOWN_MBPS:-0}" --argjson down "${HY2_CLIENT_UP_MBPS:-0}" '
       .inbounds |= map(if .type=="hysteria2" then
@@ -88,7 +89,20 @@ action_configure_hy2() {
     local protocol_candidate="$CONFIG_DIR/.hy2-protocols.$$" cache_candidate="$CONFIG_DIR/.hy2-cache.$$"
     render_protocol_state "$candidate" "$protocol_candidate" "$cache_candidate" || { rm -f "$candidate" "$protocol_candidate" "$cache_candidate"; return 1; }
     echo "HY2 监听端口: ${HY2_PORT}"
-    if [ "$HY2_HOPPING_ENABLED" = true ]; then echo "UDP 跳跃范围: ${HY2_HOP_START}-${HY2_HOP_END}，间隔 ${HY2_HOP_INTERVAL} 秒（防火墙及云安全组需放行完整范围）"; else echo 'UDP 跳跃: 关闭'; fi
+    if [ "$HY2_HOPPING_ENABLED" = true ]; then
+        echo "UDP 跳跃范围: ${HY2_HOP_START}-${HY2_HOP_END}，间隔 ${HY2_HOP_INTERVAL} 秒（防火墙及云安全组需放行完整范围）"
+        if [ "$DEPLOY_MODE" = host ]; then
+            echo "HY2 转发方式：${HY2_HOPPING_FORWARD_MODE:-nftables}"
+            if [ "${HY2_HOPPING_FORWARD_MODE:-nftables}" = external ]; then
+                echo "需要外部配置：UDP ${HY2_HOP_START}-${HY2_HOP_END} -> 容器 UDP ${HY2_HOP_START}"
+                echo "错误示例：${HY2_HOP_START}-${HY2_HOP_END}:${HY2_HOP_START}-${HY2_HOP_END}/udp（一对一映射无效，除 ${HY2_HOP_START} 外容器端口无人监听）"
+                echo "可配置整个 UDP 范围转发到 ${HY2_HOP_START}，或逐个外部端口转发到 ${HY2_HOP_START}。"
+                echo '脚本无法验证宿主机规则，请从容器外测试范围首端、中间端和末端。'
+            fi
+        fi
+    else
+        echo 'UDP 跳跃: 关闭'
+    fi
     if [ "$HY2_BRUTAL_ENABLED" = true ]; then echo "Brutal: 客户端上行 ${HY2_CLIENT_UP_MBPS} Mbps / 下行 ${HY2_CLIENT_DOWN_MBPS} Mbps"; else echo '拥塞控制: BBR（服务端强制）'; fi
     read -r -p '确认应用 HY2 设置？[y/N] ' confirm || confirm=
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then rm -f "$candidate" "$protocol_candidate" "$cache_candidate"; info '已取消，未修改节点配置'; return 0; fi
@@ -223,7 +237,7 @@ action_uninstall() {
     [[ ! "$confirm" =~ ^[Yy]$ ]] && info "已取消" && return 0
 
     info "正在卸载..."
-    if [ "$DEPLOY_MODE" = host ] && [ -x "$CONFIG_DIR/hy2-port-hopping.sh" ]; then
+    if [ "$DEPLOY_MODE" = host ]; then
         clear_hy2_hopping_runtime || { err '无法清理 HY2 专属 nftables 规则；保留配置以便重试'; return 1; }
     fi
     service_stop || true

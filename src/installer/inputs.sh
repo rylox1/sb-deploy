@@ -205,6 +205,69 @@ rand_uuid() {
 }
 
 # -----------------------
+# HY2 转发方式
+normalize_hy2_forward_mode() {
+    local mode="${1:-}" hopping="${2:-false}" deploy_mode="${3:-$DEPLOY_MODE}"
+    if [ "$deploy_mode" = docker ] || [ "$hopping" != true ]; then
+        printf '\n'
+        return 0
+    fi
+    mode="${mode:-nftables}"
+    case "$mode" in
+        nftables|external) printf '%s\n' "$mode" ;;
+        *) err "无效的 HY2 转发方式: $mode"; return 1 ;;
+    esac
+}
+
+probe_nftables_access() {
+    command -v nft >/dev/null 2>&1 && nft list tables >/dev/null 2>&1
+}
+
+select_hy2_forward_mode() {
+    local nft_available=false choice=""
+    if probe_nftables_access; then nft_available=true; fi
+    while :; do
+        echo "选择 HY2 端口跳跃转发方式："
+        if [ "$nft_available" = true ]; then
+            echo "1) 本机 nftables（需要 root/CAP_NET_ADMIN，可用）"
+            read -r -p "2) 外部端口转发（宿主机/NAT 面板负责）[默认 1]: " choice || choice=
+            choice="${choice:-1}"
+        else
+            echo "1) 本机 nftables（需要 root/CAP_NET_ADMIN，不可用）"
+            echo "2) 外部端口转发（宿主机/NAT 面板负责）"
+            warn "当前环境无法管理 nftables，请明确选择外部转发或输入 q 取消"
+            read -r -p "请选择 [2/q]: " choice || choice=q
+        fi
+        case "$choice" in
+            1)
+                if [ "$nft_available" = true ]; then
+                    HY2_HOPPING_FORWARD_MODE=nftables
+                    return 0
+                fi
+                warn "当前环境 nftables 不可用，请选择外部转发或取消"
+                ;;
+            2)
+                HY2_HOPPING_FORWARD_MODE=external
+                return 0
+                ;;
+            q|Q)
+                return 1
+                ;;
+            *) warn "无效选择，请重新输入" ;;
+        esac
+    done
+}
+
+confirm_external_forwarding() {
+    local start="$1" end="$2" answer=""
+    echo "需要外部配置：UDP ${start}-${end} -> 容器 UDP ${start}"
+    echo "错误示例：${start}-${end}:${start}-${end}/udp（一对一映射无效，除 ${start} 外容器端口无人监听）"
+    echo "可配置整个 UDP 范围转发到 ${start}，或逐个外部端口转发到 ${start}。"
+    read -r -p "确认已理解并将配置上述多对一转发？[y/N]: " answer || answer=
+    [[ "$answer" = y || "$answer" = Y ]]
+}
+
+# -----------------------
 # 配置端口和密码
 get_config() {
     info "开始配置端口和密码..."
@@ -238,6 +301,7 @@ get_config() {
         HY2_HOP_START=""
         HY2_HOP_END=""
         HY2_HOP_INTERVAL=15
+        HY2_HOPPING_FORWARD_MODE=""
         if [[ "$hop_choice" =~ ^[Yy]$ ]]; then
             while :; do
                 read -r -p "输入连续 UDP 端口范围 start-end（2-100 个端口）: " hop_range || hop_range=
@@ -256,6 +320,12 @@ get_config() {
             HY2_HOP_INTERVAL=$((10#$HY2_HOP_INTERVAL))
             (( HY2_HOP_INTERVAL >= 5 && HY2_HOP_INTERVAL <= 3600 )) || { err "跳跃间隔必须为 5-3600 的整数"; exit 1; }
             HY2_HOPPING_ENABLED=true
+            if [ "$DEPLOY_MODE" = host ]; then
+                select_hy2_forward_mode || { err "已取消 HY2 转发方式选择，未写入节点配置"; exit 1; }
+                if [ "$HY2_HOPPING_FORWARD_MODE" = external ]; then
+                    confirm_external_forwarding "$HY2_HOP_START" "$HY2_HOP_END" || { err "未确认外部端口转发，未写入节点配置"; exit 1; }
+                fi
+            fi
         fi
         read -r -p "启用 Brutal 拥塞控制? (y/N，默认 BBR): " brutal_choice || brutal_choice=
         HY2_BRUTAL_ENABLED=false

@@ -89,6 +89,14 @@ render_protocol_state() {
                 state_write_shell "$cache_out" HY2_HOP_START "${HY2_HOP_START:-}" || return 1
                 state_write_shell "$cache_out" HY2_HOP_END "${HY2_HOP_END:-}" || return 1
                 state_write_shell "$cache_out" HY2_HOP_INTERVAL "${HY2_HOP_INTERVAL:-15}" || return 1
+                if [ "$DEPLOY_MODE" = host ]; then
+                    if [ "${HY2_HOPPING_ENABLED:-false}" = true ]; then
+                        value=$(normalize_hy2_forward_mode "${HY2_HOPPING_FORWARD_MODE:-}" true host) || return 1
+                    else
+                        value=""
+                    fi
+                    state_write_shell "$cache_out" HY2_HOPPING_FORWARD_MODE "$value" || return 1
+                fi
                 local congestion_state server_up server_down client_up client_down
                 server_up=$(jq -er '.inbounds[]|select(.type=="hysteria2")|.up_mbps // empty' "$config" 2>/dev/null || true)
                 server_down=$(jq -er '.inbounds[]|select(.type=="hysteria2")|.down_mbps // empty' "$config" 2>/dev/null || true)
@@ -174,12 +182,50 @@ protocol_port_free() {
     return 0
 }
 
+select_hy2_forward_mode() {
+    local old_hopping="${1:-false}" nft_available=false choice="" current="${HY2_HOPPING_FORWARD_MODE:-}"
+    if probe_nftables_access; then nft_available=true; fi
+    if [ "${HY2_HOPPING_FORWARD_MODE_LEGACY:-false}" = true ] && [ "$old_hopping" = true ]; then current='nftables（旧配置）'; fi
+    [ -n "$current" ] || { [ "$old_hopping" = true ] && current=nftables || current=未设置; }
+    while :; do
+        echo "当前 HY2 转发方式：$current"
+        echo '选择 HY2 端口跳跃转发方式：'
+        if [ "$nft_available" = true ]; then
+            echo '1) 本机 nftables（需要 root/CAP_NET_ADMIN，可用）'
+            read -r -p '2) 外部端口转发（宿主机/NAT 面板负责）[默认 1]: ' choice || choice=
+            choice="${choice:-1}"
+        else
+            echo '1) 本机 nftables（需要 root/CAP_NET_ADMIN，不可用）'
+            echo '2) 外部端口转发（宿主机/NAT 面板负责）'
+            warn '当前环境无法管理 nftables，请明确选择外部转发或输入 q 取消'
+            read -r -p '请选择 [2/q]: ' choice || choice=q
+        fi
+        case "$choice" in
+            1) if [ "$nft_available" = true ]; then HY2_HOPPING_FORWARD_MODE=nftables; return 0; fi; warn '当前环境 nftables 不可用，请选择外部转发或取消' ;;
+            2) HY2_HOPPING_FORWARD_MODE=external; return 0 ;;
+            q|Q) return 1 ;;
+            *) warn '无效选择，请重新输入' ;;
+        esac
+    done
+}
+
+confirm_external_forwarding() {
+    local start="$1" end="$2" answer=""
+    echo "需要外部配置：UDP ${start}-${end} -> 容器 UDP ${start}"
+    echo "错误示例：${start}-${end}:${start}-${end}/udp（一对一映射无效，除 ${start} 外容器端口无人监听）"
+    echo "可配置整个 UDP 范围转发到 ${start}，或逐个外部端口转发到 ${start}。"
+    read -r -p '确认已理解并将配置上述多对一转发？[y/N]: ' answer || answer=
+    [[ "$answer" = y || "$answer" = Y ]]
+}
+
 collect_hy2_settings() {
     local port="$1" choice range interval up down
     local old_hopping="${HY2_HOPPING_ENABLED:-false}" old_start="${HY2_HOP_START:-}" old_end="${HY2_HOP_END:-}" old_interval="${HY2_HOP_INTERVAL:-15}"
     local old_brutal="${HY2_BRUTAL_ENABLED:-false}" old_up="${HY2_CLIENT_UP_MBPS:-}" old_down="${HY2_CLIENT_DOWN_MBPS:-}"
+    local old_forward_mode="${HY2_HOPPING_FORWARD_MODE:-}"
+    HY2_SETTINGS_CANCELLED=false
     HY2_PORT="$port"
-    HY2_HOPPING_ENABLED=false; HY2_HOP_START=""; HY2_HOP_END=""; HY2_HOP_INTERVAL=15
+    HY2_HOPPING_ENABLED=false; HY2_HOP_START=""; HY2_HOP_END=""; HY2_HOP_INTERVAL=15; HY2_HOPPING_FORWARD_MODE=""
     local hop_default=N brutal_default=N
     [ "$old_hopping" = true ] && hop_default=Y
     read -r -p "启用 HY2 UDP 端口跳跃？[y/N，当前 ${old_hopping}] " choice || choice=
@@ -200,6 +246,19 @@ collect_hy2_settings() {
         HY2_HOP_INTERVAL=$((10#$HY2_HOP_INTERVAL))
         HY2_HOPPING_ENABLED=true
         HY2_PORT=$HY2_HOP_START
+        if [ "$DEPLOY_MODE" = host ]; then
+            HY2_HOPPING_FORWARD_MODE="$old_forward_mode"
+            if ! select_hy2_forward_mode "$old_hopping"; then
+                HY2_SETTINGS_CANCELLED=true
+                info '已取消，未修改节点配置'
+                return 0
+            fi
+            if [ "$HY2_HOPPING_FORWARD_MODE" = external ] && ! confirm_external_forwarding "$HY2_HOP_START" "$HY2_HOP_END"; then
+                HY2_SETTINGS_CANCELLED=true
+                info '已取消，未修改节点配置'
+                return 0
+            fi
+        fi
     fi
     [ "$old_brutal" = true ] && brutal_default=Y
     read -r -p "启用 Brutal 拥塞控制？[y/N，当前 ${old_brutal}] " choice || choice=
@@ -220,6 +279,7 @@ collect_protocol_inbound() {
         ss) read -r -p 'SS 加密方式 [1=2022-blake3-aes-128-gcm, 2=aes-128-gcm，默认 1]: ' choice || choice=; method=2022-blake3-aes-128-gcm; [ "$choice" = 2 ] && method=aes-128-gcm; pass=$(rand_pass); jq -n --argjson port "$port" --arg method "$method" --arg pass "$pass" '{type:"shadowsocks",listen:"::",listen_port:$port,method:$method,password:$pass,tag:"ss-in"}' > "$TX_DIR/$key.json" ;;
         hy2)
             collect_hy2_settings "$port" || return 1
+            [ "${HY2_SETTINGS_CANCELLED:-false}" = false ] || return 2
             validate_hy2_runtime_prerequisites || return 1
             port="$HY2_PORT"
             pass=$(rand_pass)
@@ -270,25 +330,42 @@ protocol_transaction_signal_handler() {
 apply_protocol_transaction() {
     local candidate="$1" new_protocols="$2" cache_candidate="$3" uri_backup="$4" file item config_check
     local saved_int_trap saved_term_trap saved_hup_trap
+    if [ "$DEPLOY_MODE" = host ] && jq -e '[.inbounds[]?|select(.type=="hysteria2")]|length>0' "$candidate" >/dev/null && [ "${HY2_HOPPING_ENABLED:-false}" = true ]; then
+        validate_hy2_runtime_prerequisites || return 1
+    fi
     saved_int_trap=$(trap -p INT); saved_term_trap=$(trap -p TERM); saved_hup_trap=$(trap -p HUP)
     local snapshot="$TX_DIR/backup"; mkdir -m 700 "$snapshot" || return 1
     local rollback_active=false
     for file in config.json .protocols .config_cache uris.txt .reality_pub .reality_sid certs/fullchain.pem certs/privkey.pem docker-compose.yml hy2-port-hopping.sh; do
         if [ -e "$CONFIG_DIR/$file" ]; then mkdir -p "$snapshot/$(dirname "$file")" || return 1; cp -p "$CONFIG_DIR/$file" "$snapshot/$file" || return 1; touch "$snapshot/$file.present" || return 1; fi
     done
-    local hopping_service_file=""
+    local hopping_service_file="" hopping_runlevel_file="" hopping_was_enabled=false
     if [ "$DEPLOY_MODE" = host ]; then
         hopping_service_file=$(hy2_hopping_service_file) || return 1
         if [ -e "$hopping_service_file" ]; then
             cp -p "$hopping_service_file" "$snapshot/hopping-service" || return 1
             touch "$snapshot/hopping-service.present" || return 1
         fi
+        if [ "$OS" = alpine ]; then
+            hopping_runlevel_file=$(hy2_hopping_runlevel_file) || return 1
+            [ ! -L "$hopping_runlevel_file" ] || hopping_was_enabled=true
+        elif command -v systemctl >/dev/null 2>&1; then
+            systemctl is-enabled --quiet sb-deploy-hy2-hopping.service && hopping_was_enabled=true
+        fi
+        [ "$hopping_was_enabled" = true ] && touch "$snapshot/hopping-service.enabled"
     fi
     rollback_protocol_transaction() {
         local path restore_ok=true service_ok=false
         [ "$rollback_active" = true ] || return 0
         rollback_active=false
         rm -f "$CONFIG_DIR/config.json.tmp.$$" "$CONFIG_DIR/.protocols.tmp.$$" "$CONFIG_DIR/.config_cache.tmp.$$" "$CONFIG_DIR/uris.txt.tmp.$$" || restore_ok=false
+        if [ "$DEPLOY_MODE" = host ]; then
+            if [ "${HY2_HOPPING_FORWARD_MODE:-}" = nftables ]; then
+                cleanup_hy2_hopping_runtime true || restore_ok=false
+            else
+                cleanup_hy2_hopping_runtime || restore_ok=false
+            fi
+        fi
         for path in config.json .protocols .config_cache uris.txt .reality_pub .reality_sid certs/fullchain.pem certs/privkey.pem docker-compose.yml hy2-port-hopping.sh; do
             if [ -f "$snapshot/$path.present" ]; then
                 mkdir -p "$CONFIG_DIR/$(dirname "$path")" && cp -p "$snapshot/$path" "$CONFIG_DIR/$path" || restore_ok=false
@@ -298,33 +375,23 @@ apply_protocol_transaction() {
         done
         if [ "$DEPLOY_MODE" = host ]; then
             if [ -f "$snapshot/hopping-service.present" ]; then
-                if mkdir -p "$(dirname "$hopping_service_file")" && cp -p "$snapshot/hopping-service" "$hopping_service_file"; then
-                    if [ "$OS" = alpine ]; then
-                        rc-update add sb-deploy-hy2-hopping default >/dev/null 2>&1 || restore_ok=false
-                    elif systemctl daemon-reload >/dev/null 2>&1 && systemctl enable sb-deploy-hy2-hopping.service >/dev/null 2>&1; then
-                        :
-                    else
-                        restore_ok=false
-                    fi
-                else
-                    restore_ok=false
-                fi
-            else
-                if [ -e "$hopping_service_file" ]; then
-                    if [ "$OS" = alpine ]; then
-                        rc-service sb-deploy-hy2-hopping stop >/dev/null 2>&1 || restore_ok=false
-                        rc-update del sb-deploy-hy2-hopping default >/dev/null 2>&1 || restore_ok=false
-                    else
-                        systemctl disable --now sb-deploy-hy2-hopping.service >/dev/null 2>&1 || restore_ok=false
-                    fi
-                fi
+                mkdir -p "$(dirname "$hopping_service_file")" && cp -p "$snapshot/hopping-service" "$hopping_service_file" || restore_ok=false
+            elif [ -e "$hopping_service_file" ]; then
                 rm -f "$hopping_service_file" || restore_ok=false
-                if [ "$OS" != alpine ] && command -v systemctl >/dev/null 2>&1; then
-                    systemctl daemon-reload >/dev/null 2>&1 || restore_ok=false
+            fi
+            if [ "$OS" = alpine ]; then
+                if [ -f "$snapshot/hopping-service.enabled" ]; then
+                    rc-update add sb-deploy-hy2-hopping default >/dev/null 2>&1 || restore_ok=false
+                elif [ -L "$hopping_runlevel_file" ]; then
+                    rc-update del sb-deploy-hy2-hopping default >/dev/null 2>&1 || restore_ok=false
                 fi
+            elif [ -f "$snapshot/hopping-service.enabled" ]; then
+                systemctl daemon-reload >/dev/null 2>&1 && systemctl enable sb-deploy-hy2-hopping.service >/dev/null 2>&1 || restore_ok=false
+            elif [ -e "$hopping_service_file" ] || { command -v systemctl >/dev/null 2>&1 && systemctl is-enabled --quiet sb-deploy-hy2-hopping.service; }; then
+                systemctl disable sb-deploy-hy2-hopping.service >/dev/null 2>&1 || restore_ok=false
+                systemctl daemon-reload >/dev/null 2>&1 || restore_ok=false
             fi
         fi
-        if [ "$DEPLOY_MODE" = host ] && [ ! -x "$CONFIG_DIR/hy2-port-hopping.sh" ] && command -v nft >/dev/null 2>&1; then nft delete table inet sb_deploy_hy2 >/dev/null 2>&1 || true; fi
         if [ "$DEPLOY_MODE" = docker ]; then
             docker_compose up -d --force-recreate && service_ok=true
         else
@@ -364,11 +431,6 @@ apply_protocol_transaction() {
         src=${item%%:*}; dst=${item#*:}; tmp="$dst.tmp.$$"
         cp "$src" "$tmp" && mv "$tmp" "$dst" || { rollback_protocol_transaction; protocol_transaction_restore_signal_traps; return 1; }
     done
-    if [ "$DEPLOY_MODE" = host ] && jq -e '[.inbounds[]?|select(.type=="hysteria2")]|length>0' "$candidate" >/dev/null && [ "${HY2_HOPPING_ENABLED:-false}" = true ]; then
-        ensure_hy2_hopping_runtime || { err 'HY2 nftables 规则应用失败，正在回滚'; rollback_protocol_transaction; protocol_transaction_restore_signal_traps; return 1; }
-    elif [ "$DEPLOY_MODE" = host ] && [ -x "$CONFIG_DIR/hy2-port-hopping.sh" ]; then
-        "$CONFIG_DIR/hy2-port-hopping.sh" clear || { err 'HY2 nftables 规则清理失败，正在回滚'; rollback_protocol_transaction; protocol_transaction_restore_signal_traps; return 1; }
-    fi
     service_restart || { err '新配置服务重启失败，正在回滚'; rollback_protocol_transaction; protocol_transaction_restore_signal_traps; return 1; }
     generate_uris || { err '链接重建失败，正在回滚'; rollback_protocol_transaction; protocol_transaction_restore_signal_traps; return 1; }
     if ! jq -e '[.inbounds[]?|select((.type=="vless" or .type=="anytls") and .tls.reality.enabled==true)]|length>0' "$CONFIG_DIR/config.json" >/dev/null; then
@@ -405,7 +467,6 @@ action_manage_protocols_impl() {
         if [ "${requested[$i]:-}" = 1 ]; then [ "$enabled" = true ] && unchanged+="$key " || added+="$key "; else [ "$enabled" = true ] && removed+="$key "; fi
     done
     if [ -z "$added$removed" ]; then info '协议集合没有变化，无需调整'; return 0; fi
-    validate_hy2_runtime_prerequisites "${HY2_HOPPING_ENABLED:-false}" || return 1
     TX_DIR=$(mktemp -d "$CONFIG_DIR/.protocol-update.XXXXXX") || return 1
     chmod 700 "$TX_DIR" && mkdir "$TX_DIR/material" || { rm -rf "$TX_DIR"; TX_DIR=""; return 1; }
     local reality_retained=false cert_retained=false
@@ -442,7 +503,10 @@ action_manage_protocols_impl() {
         fi
         validate_port "$raw" || return 1
         protocol_port_free "$key" "$raw" || { err "端口 $raw 与目标协议发生传输层冲突"; return 1; }
-        collect_protocol_inbound "$key" "$raw" || return 1
+        local collect_status=0
+        if collect_protocol_inbound "$key" "$raw"; then :; else collect_status=$?; fi
+        [ "$collect_status" -ne 2 ] || { info '已取消，未修改节点配置'; return 0; }
+        [ "$collect_status" -eq 0 ] || return 1
     done
     local candidate="$TX_DIR/candidate.json" jq_args=() filter=''
     for key in $removed; do type=$(protocol_type "$key"); jq_args+=(--arg "remove_$key" "$type"); filter+="| map(select(.type != \$remove_$key))"; done
@@ -460,6 +524,15 @@ action_manage_protocols_impl() {
     fi
     render_protocol_state "$candidate" "$TX_DIR/protocols" "$TX_DIR/cache" || { err '候选协议状态生成失败，未修改节点配置'; return 1; }
     echo "将新增：${added:-无}"; echo "将删除：${removed:-无}"; echo "保持不变：${unchanged:-无}"
+    if [ "$DEPLOY_MODE" = host ] && [ "${HY2_HOPPING_ENABLED:-false}" = true ] && jq -e '[.inbounds[]?|select(.type=="hysteria2")]|length>0' "$candidate" >/dev/null; then
+        echo "HY2 转发方式：${HY2_HOPPING_FORWARD_MODE:-nftables}"
+        if [ "${HY2_HOPPING_FORWARD_MODE:-nftables}" = external ]; then
+            echo "需要外部配置：UDP ${HY2_HOP_START}-${HY2_HOP_END} -> 容器 UDP ${HY2_HOP_START}"
+            echo "错误示例：${HY2_HOP_START}-${HY2_HOP_END}:${HY2_HOP_START}-${HY2_HOP_END}/udp（一对一映射无效，除 ${HY2_HOP_START} 外容器端口无人监听）"
+            echo "可配置整个 UDP 范围转发到 ${HY2_HOP_START}，或逐个外部端口转发到 ${HY2_HOP_START}。"
+            echo '脚本无法验证宿主机规则，请从容器外测试范围首端、中间端和末端。'
+        fi
+    fi
     read -r -p '确认应用以上变更？[y/N] ' confirm || confirm=
     [[ "$confirm" =~ ^[Yy]$ ]] || { info '已取消，未修改配置'; return 0; }
     apply_protocol_transaction "$candidate" "$TX_DIR/protocols" "$TX_DIR/cache" "$TX_DIR/uri-backup" || return 1

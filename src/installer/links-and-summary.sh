@@ -68,6 +68,13 @@ generate_uris() {
         echo ""
         echo "=== Hysteria2 Mihomo / mihomo-kit 扩展 URI（非官方扩展） ==="
         echo "hy2://${hy2_encoded}@${hy2_host}:${authority_port}/?sni=www.bing.com&alpn=h3&insecure=1${mihomo_query}#${hy2_fragment}"
+        if [ "$DEPLOY_MODE" = host ] && [ "${HY2_HOPPING_ENABLED:-false}" = true ] && [ "${HY2_HOPPING_FORWARD_MODE:-nftables}" = external ]; then
+            echo ''
+            echo "# 外部转发契约：UDP ${HY2_HOP_START}-${HY2_HOP_END} -> 容器 UDP ${HY2_HOP_START}"
+            echo "# 配置整个 UDP 范围到单端口，或逐个外部 UDP 端口映射到容器 UDP ${HY2_HOP_START}。"
+            echo "# 不要使用 ${HY2_HOP_START}-${HY2_HOP_END}:${HY2_HOP_START}-${HY2_HOP_END}/udp 一对一映射；范围内只有首端在容器中监听。"
+            echo "# 脚本无法验证宿主机规则，请从容器外测试范围首端、中间端和末端。"
+        fi
         echo ""
     fi
 
@@ -102,7 +109,24 @@ echo "=========================================="
 echo ""
 info "📋 配置信息:"
 $ENABLE_SS && echo "   SS 端口: $PORT_SS | 密码: $PSK_SS | 加密: $SS_METHOD"
-$ENABLE_HY2 && { echo "   HY2 监听端口: $PORT_HY2 | 密码: $PSK_HY2"; if [ "${HY2_HOPPING_ENABLED:-false}" = true ]; then echo "   HY2 UDP 放行范围: $HY2_HOP_START-$HY2_HOP_END | 跳跃间隔: ${HY2_HOP_INTERVAL}s（请在主机防火墙和云安全组放行完整范围）"; fi; if [ "${HY2_BRUTAL_ENABLED:-false}" = true ]; then echo "   HY2 拥塞控制: Brutal（客户端上行 ${HY2_CLIENT_UP_MBPS} Mbps / 下行 ${HY2_CLIENT_DOWN_MBPS} Mbps）"; else echo "   HY2 拥塞控制: BBR（服务端强制）"; fi; }
+$ENABLE_HY2 && {
+    echo "   HY2 监听端口: $PORT_HY2 | 密码: $PSK_HY2"
+    if [ "${HY2_HOPPING_ENABLED:-false}" = true ]; then
+        echo "   HY2 UDP 放行范围: $HY2_HOP_START-$HY2_HOP_END | 跳跃间隔: ${HY2_HOP_INTERVAL}s（请在主机防火墙和云安全组放行完整范围）"
+        if [ "$DEPLOY_MODE" = docker ]; then
+            echo "   HY2 端口映射: Docker Compose 管理"
+        elif [ "${HY2_HOPPING_FORWARD_MODE:-nftables}" = external ]; then
+            echo "   外部转发契约: UDP $HY2_HOP_START-$HY2_HOP_END → 容器 UDP $HY2_HOP_START"
+            echo "   请使用范围到单端口或逐条多对一映射；${HY2_HOP_START}-${HY2_HOP_END}:${HY2_HOP_START}-${HY2_HOP_END}/udp 一对一映射无效。"
+            echo "   脚本无法验证外部规则，请从容器外测试范围首端、中间端和末端。"
+        fi
+    fi
+    if [ "${HY2_BRUTAL_ENABLED:-false}" = true ]; then
+        echo "   HY2 拥塞控制: Brutal（客户端上行 ${HY2_CLIENT_UP_MBPS} Mbps / 下行 ${HY2_CLIENT_DOWN_MBPS} Mbps）"
+    else
+        echo "   HY2 拥塞控制: BBR（服务端强制）"
+    fi
+}
 $ENABLE_TUIC && echo "   TUIC 端口: $PORT_TUIC | UUID: $UUID_TUIC | 密码: $PSK_TUIC"
 $ENABLE_REALITY && echo "   Reality 端口: $PORT_REALITY | UUID: $UUID"
 $ENABLE_ANYTLS && echo "   AnyTLS 端口: $PORT_ANYTLS | 用户: $ANYTLS_USER | 密码: $ANYTLS_PSK"
