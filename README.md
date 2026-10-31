@@ -9,15 +9,17 @@
 安装全功能 sing-box：
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/rylox1/sb-deploy/main/install-singbox.sh)"
+curl -fsSL https://raw.githubusercontent.com/rylox1/sb-deploy/main/install-singbox.sh -o /tmp/install-singbox.sh && bash /tmp/install-singbox.sh
 ```
+
+脚本体积已超过 Linux 单个命令行参数的上限（131072 字节），不能再使用 `bash -c "$(curl …)"`，需先下载再执行。
 
 ### Docker 部署
 
 运行全功能安装脚本后选择 **Docker 部署**，或显式指定：
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/rylox1/sb-deploy/main/install-singbox.sh)" -- --docker
+curl -fsSL https://raw.githubusercontent.com/rylox1/sb-deploy/main/install-singbox.sh -o /tmp/install-singbox.sh && bash /tmp/install-singbox.sh --docker
 ```
 
 Docker 模式面向 Linux 主机，不要求安装脚本以 root 运行，但要求本机已安装 Docker Engine、Docker Compose（`docker compose` 插件或 `docker-compose`），且当前用户可以访问 Docker daemon。脚本不会自动安装 Docker；本地还需 `curl`、`openssl` 和 `jq`。
