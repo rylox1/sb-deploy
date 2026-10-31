@@ -45,9 +45,29 @@ generate_uris() {
     fi
 
     if $ENABLE_HY2; then
-        hy2_encoded=$(printf "%s" "$PSK_HY2" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
-        echo "=== Hysteria2 (HY2) ==="
-        echo "hy2://${hy2_encoded}@${host}:${PORT_HY2}/?sni=www.bing.com&alpn=h3&insecure=1#hy2${suffix}"
+        hy2_encoded=$(printf '%s' "$PSK_HY2" | jq -sRr @uri)
+        local hy2_fragment hy2_host="$host" authority_port="$PORT_HY2" mihomo_query="" shadow_query=""
+        hy2_fragment=$(printf '%s' "hy2${suffix}" | jq -sRr @uri) || return 1
+        [[ "$hy2_host" == *:* && "$hy2_host" != \[*\] ]] && hy2_host="[$hy2_host]"
+        if [ "${HY2_HOPPING_ENABLED:-false}" = true ]; then
+            authority_port="$HY2_HOP_START-$HY2_HOP_END"
+            mihomo_query="&hop-interval=$HY2_HOP_INTERVAL"
+            shadow_query="mport=$HY2_HOP_START-$HY2_HOP_END&"
+        fi
+        if [ "${HY2_BRUTAL_ENABLED:-false}" = true ]; then
+            mihomo_query+="&up=$HY2_CLIENT_UP_MBPS&down=$HY2_CLIENT_DOWN_MBPS"
+        fi
+        echo "=== Hysteria2 标准 URI（通用） ==="
+        echo "hy2://${hy2_encoded}@${hy2_host}:${authority_port}/?sni=www.bing.com&alpn=h3&insecure=1#${hy2_fragment}"
+        echo ""
+        echo "=== Hysteria2 Shadowrocket URI ==="
+        echo "hy2://${hy2_encoded}@${hy2_host}:${PORT_HY2}/?${shadow_query}sni=www.bing.com&alpn=h3&insecure=1#${hy2_fragment}"
+        if [ "${HY2_HOPPING_ENABLED:-false}" = true ] || [ "${HY2_BRUTAL_ENABLED:-false}" = true ]; then
+            echo "提示：Shadowrocket 请手动核对端口跳跃和/或 Brutal 上下行速率设置。"
+        fi
+        echo ""
+        echo "=== Hysteria2 Mihomo / mihomo-kit 扩展 URI（非官方扩展） ==="
+        echo "hy2://${hy2_encoded}@${hy2_host}:${authority_port}/?sni=www.bing.com&alpn=h3&insecure=1${mihomo_query}#${hy2_fragment}"
         echo ""
     fi
 
@@ -82,7 +102,7 @@ echo "=========================================="
 echo ""
 info "📋 配置信息:"
 $ENABLE_SS && echo "   SS 端口: $PORT_SS | 密码: $PSK_SS | 加密: $SS_METHOD"
-$ENABLE_HY2 && echo "   HY2 端口: $PORT_HY2 | 密码: $PSK_HY2"
+$ENABLE_HY2 && { echo "   HY2 监听端口: $PORT_HY2 | 密码: $PSK_HY2"; if [ "${HY2_HOPPING_ENABLED:-false}" = true ]; then echo "   HY2 UDP 放行范围: $HY2_HOP_START-$HY2_HOP_END | 跳跃间隔: ${HY2_HOP_INTERVAL}s（请在主机防火墙和云安全组放行完整范围）"; fi; if [ "${HY2_BRUTAL_ENABLED:-false}" = true ]; then echo "   HY2 拥塞控制: Brutal（客户端上行 ${HY2_CLIENT_UP_MBPS} Mbps / 下行 ${HY2_CLIENT_DOWN_MBPS} Mbps）"; else echo "   HY2 拥塞控制: BBR（服务端强制）"; fi; }
 $ENABLE_TUIC && echo "   TUIC 端口: $PORT_TUIC | UUID: $UUID_TUIC | 密码: $PSK_TUIC"
 $ENABLE_REALITY && echo "   Reality 端口: $PORT_REALITY | UUID: $UUID"
 $ENABLE_ANYTLS && echo "   AnyTLS 端口: $PORT_ANYTLS | 用户: $ANYTLS_USER | 密码: $ANYTLS_PSK"
@@ -100,9 +120,10 @@ echo "   配置: $CONFIG_PATH"
 echo "   服务: $SERVICE_PATH"
 echo ""
 info "📜 客户端链接:"
-generate_uris | while IFS= read -r line; do
+generate_uris > "$CONFIG_DIR/uris.txt.tmp" && mv "$CONFIG_DIR/uris.txt.tmp" "$CONFIG_DIR/uris.txt"
+while IFS= read -r line; do
     echo "   $line"
-done
+done < "$CONFIG_DIR/uris.txt"
 echo ""
 info "🔧 管理命令:"
 if [ "$DEPLOY_MODE" = "docker" ]; then

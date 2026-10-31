@@ -16,7 +16,7 @@ install_deps() {
     case "$OS" in
         alpine)
             apk update || { err "apk update 失败"; exit 1; }
-            apk add --no-cache bash curl ca-certificates openssl openrc jq || {
+            apk add --no-cache bash curl ca-certificates openssl openrc jq nftables || {
                 err "依赖安装失败"
                 exit 1
             }
@@ -24,13 +24,13 @@ install_deps() {
         debian)
             export DEBIAN_FRONTEND=noninteractive
             apt-get update -y || { err "apt update 失败"; exit 1; }
-            apt-get install -y curl ca-certificates openssl jq || {
+            apt-get install -y curl ca-certificates openssl jq nftables || {
                 err "依赖安装失败"
                 exit 1
             }
             ;;
         redhat)
-            yum install -y curl ca-certificates openssl jq || {
+            yum install -y curl ca-certificates openssl jq nftables || {
                 err "依赖安装失败"
                 exit 1
             }

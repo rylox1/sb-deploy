@@ -231,8 +231,46 @@ get_config() {
             read -p "请输入 HY2 端口(留空则随机 10000-60000): " USER_PORT_HY2
             PORT_HY2="${USER_PORT_HY2:-$(rand_port)}"
         fi
+        local hop_choice hop_range hop_interval brutal_choice client_up client_down
+        [[ "$PORT_HY2" =~ ^[1-9][0-9]{0,4}$ ]] && (( PORT_HY2 <= 65535 )) || { err "HY2 端口必须为 1-65535 的整数"; exit 1; }
+        read -r -p "启用 HY2 UDP 端口跳跃? (y/N，默认关闭): " hop_choice || hop_choice=
+        HY2_HOPPING_ENABLED=false
+        HY2_HOP_START=""
+        HY2_HOP_END=""
+        HY2_HOP_INTERVAL=15
+        if [[ "$hop_choice" =~ ^[Yy]$ ]]; then
+            while :; do
+                read -r -p "输入连续 UDP 端口范围 start-end（2-100 个端口）: " hop_range || hop_range=
+                if [[ "$hop_range" =~ ^([0-9]{1,5})-([0-9]{1,5})$ ]]; then
+                    HY2_HOP_START=$((10#${BASH_REMATCH[1]}))
+                    HY2_HOP_END=$((10#${BASH_REMATCH[2]}))
+                    local count=$((HY2_HOP_END - HY2_HOP_START + 1))
+                    if (( HY2_HOP_START >= 1 && HY2_HOP_END <= 65535 && count >= 2 && count <= 100 )); then break; fi
+                fi
+                warn "范围必须有效且包含 2–100 个连续端口"
+            done
+            PORT_HY2=$HY2_HOP_START
+            read -r -p "跳跃间隔秒数 [15]（5-3600）: " hop_interval || hop_interval=
+            HY2_HOP_INTERVAL=${hop_interval:-15}
+            [[ "$HY2_HOP_INTERVAL" =~ ^[0-9]+$ ]] || { err "跳跃间隔必须为 5-3600 的整数"; exit 1; }
+            HY2_HOP_INTERVAL=$((10#$HY2_HOP_INTERVAL))
+            (( HY2_HOP_INTERVAL >= 5 && HY2_HOP_INTERVAL <= 3600 )) || { err "跳跃间隔必须为 5-3600 的整数"; exit 1; }
+            HY2_HOPPING_ENABLED=true
+        fi
+        read -r -p "启用 Brutal 拥塞控制? (y/N，默认 BBR): " brutal_choice || brutal_choice=
+        HY2_BRUTAL_ENABLED=false
+        HY2_CLIENT_UP_MBPS=""
+        HY2_CLIENT_DOWN_MBPS=""
+        if [[ "$brutal_choice" =~ ^[Yy]$ ]]; then
+            read -r -p "客户端上行 Mbps（正整数）: " client_up || client_up=
+            read -r -p "客户端下行 Mbps（正整数）: " client_down || client_down=
+            [[ "$client_up" =~ ^[1-9][0-9]*$ && "$client_down" =~ ^[1-9][0-9]*$ ]] || { err "Brutal 上下行速率必须为正整数"; exit 1; }
+            HY2_BRUTAL_ENABLED=true
+            HY2_CLIENT_UP_MBPS=$client_up
+            HY2_CLIENT_DOWN_MBPS=$client_down
+        fi
         PSK_HY2=$(rand_pass)
-        info "HY2 端口: $PORT_HY2"
+        info "HY2 监听端口: $PORT_HY2"
         info "HY2 密码已自动生成"
     fi
 

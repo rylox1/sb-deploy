@@ -28,13 +28,13 @@ Docker 模式面向 Linux 主机，不要求安装脚本以 root 运行，但要
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Docker 使用 bridge 网络，并按协议发布端口：SS 映射 TCP/UDP，HY2 和 TUIC 映射 UDP，VLESS Reality 和 AnyTLS Reality 映射 TCP。每项均使用相同的主机端口和容器监听端口（`端口:端口`）；修改端口或配置后，`sb` 管理器会同步更新 Compose 映射并重建容器。脚本不会自动修改云安全组或主机防火墙，需由用户自行放行相应协议和端口。
+Docker 使用 bridge 网络，并按协议发布端口：SS 映射 TCP/UDP，HY2 和 TUIC 映射 UDP，VLESS Reality 和 AnyTLS Reality 映射 TCP。每项均使用相同的主机端口和容器监听端口（`端口:端口`）；修改端口或配置后，`sb` 管理器会同步更新 Compose 映射并重建容器。HY2 可选连续 2–100 个 UDP 端口跳跃，Docker bridge 会逐端口映射到同一 HY2 监听端口；Host 使用专属 nftables 表将范围转发至监听端口。使用跳跃时需自行在主机防火墙和云安全组放行完整 UDP 范围。脚本不会修改其他 nftables 表或自动修改云安全组。
 
 ### 已部署节点调整协议
 
 README 推荐的一键入口 `install-singbox.sh` 同样用于更新已有节点管理器。对已有配置再次运行同一安装命令时，默认选择“安全更新管理器并调整协议”，只更新 `sb` 管理器并打开协议调整菜单，不重建配置、不旋转现存凭据，也不重启服务；只有明确选择“重新安装并重建配置”才会进入完整安装流程。既有 Host 节点需以 root 运行，Docker 节点仍需当前用户可访问 Docker daemon。
 
-也可在节点上直接运行 `sb`，选择 **4) 调整协议**，输入期望保留的最终协议编号集合（SS、Hysteria2、TUIC、VLESS Reality、AnyTLS Reality），确认新增/删除摘要后应用。至少保留一种协议；删除协议会立即撤销对应旧链接，再次添加时生成新凭据。应用前会校验候选配置，成功后同步状态文件、链接及 Docker Compose 端口映射。协议调整不会自动修改主机防火墙或云厂商安全组，新端口需自行开放。
+也可在节点上直接运行 `sb`，选择 **4) 调整协议**，输入期望保留的最终协议编号集合（SS、Hysteria2、TUIC、VLESS Reality、AnyTLS Reality），确认新增/删除摘要后应用。至少保留一种协议；删除协议会立即撤销对应旧链接，再次添加时生成新凭据。应用前会校验候选配置，成功后同步状态文件、链接及 Docker Compose 端口映射。HY2 菜单可调整固定端口/跳跃范围、15 秒默认跳跃间隔及 BBR/Brutal；Brutal 需手动填写客户端视角上下行 Mbps，默认服务端强制 BBR。`uris.txt` 分别列出通用标准、Shadowrocket `mport` 和 Mihomo/mihomo-kit 扩展 URI；后者扩展参数并非所有第三方导入器均支持。新端口需自行在主机防火墙或云安全组开放；跳跃启用时应放行完整 UDP 范围。
 
 此安全升级和协议管理能力仅由本 README 当前推荐的 `install-singbox.sh` 提供，历史安装器入口不包含该功能。
 

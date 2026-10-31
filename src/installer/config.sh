@@ -34,6 +34,7 @@ INBOUND_SS
       "tag": "hy2-in",
       "listen": "::",
       "listen_port": PORT_HY2_PLACEHOLDER,
+      "ignore_client_bandwidth": true,
       "users": [
         {
           "password": "PSK_HY2_PLACEHOLDER"
@@ -192,7 +193,28 @@ CONFIG_HEAD
 CONFIG_TAIL
 
     sed -i "s/__LOG_DISABLED__/$LOG_DISABLED_JSON/g" "$CONFIG_PATH"
+    if $ENABLE_HY2; then
+        if [ "${HY2_BRUTAL_ENABLED:-false}" = true ]; then
+            jq --argjson up "$HY2_CLIENT_DOWN_MBPS" --argjson down "$HY2_CLIENT_UP_MBPS" '
+              .inbounds |= map(if .type=="hysteria2" then . + {ignore_client_bandwidth:true,up_mbps:$up,down_mbps:$down} else . end)
+            ' "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && mv "$CONFIG_PATH.tmp" "$CONFIG_PATH" || { err "写入 HY2 Brutal 设置失败"; exit 1; }
+        fi
+    fi
     rm -f "$TEMP_INBOUNDS"
+
+    if $ENABLE_HY2 && [ "${HY2_HOPPING_ENABLED:-false}" = true ]; then
+        jq -e --argjson start "$HY2_HOP_START" --argjson end "$HY2_HOP_END" '
+          [.inbounds[]? | select(.listen_port|type=="number") | {type,port:.listen_port,reality:(.tls.reality.enabled==true)}] as $items |
+          all($items[]; . as $item |
+            if $item.type=="hysteria2" then $item.port==$start
+            else
+              (if $item.type=="vless" or $item.type=="anytls" then ($item.reality|not)
+               else true end) as $udp |
+              (($udp|not) or $item.port < $start or $item.port > $end)
+            end
+          )
+        ' "$CONFIG_PATH" >/dev/null || { err "HY2 UDP 跳跃范围与其他 inbound 冲突"; exit 1; }
+    fi
 
     local config_valid=false
     if [ "$DEPLOY_MODE" = "docker" ]; then
@@ -228,6 +250,13 @@ CACHEEOF
     $ENABLE_HY2 && cat >> "$CACHE_FILE" <<CACHEEOF
 HY2_PORT=$PORT_HY2
 HY2_PSK=$PSK_HY2
+HY2_HOPPING_ENABLED=${HY2_HOPPING_ENABLED:-false}
+HY2_HOP_START=${HY2_HOP_START:-}
+HY2_HOP_END=${HY2_HOP_END:-}
+HY2_HOP_INTERVAL=${HY2_HOP_INTERVAL:-15}
+HY2_BRUTAL_ENABLED=${HY2_BRUTAL_ENABLED:-false}
+HY2_CLIENT_UP_MBPS=${HY2_CLIENT_UP_MBPS:-}
+HY2_CLIENT_DOWN_MBPS=${HY2_CLIENT_DOWN_MBPS:-}
 CACHEEOF
 
     $ENABLE_TUIC && cat >> "$CACHE_FILE" <<CACHEEOF

@@ -72,7 +72,7 @@ jq() {
         printf '%s\n' "$output"
     fi
 }
-action_manage_protocols <<< $'2 4 5\n2055\ny'
+action_manage_protocols <<< $'2 4 5\n2055\n\n\ny'
 [ "$(jq -r '.inbounds[] | select(.type=="hysteria2") | .listen_port' "$CONFIG_PATH")" = 2055 ]
 [ "$(jq -c '[.inbounds[] | select(.type=="vless" or .type=="anytls")]' "$CONFIG_PATH")" = "$before_inbounds" ]
 grep -E '^(vless|anytls)://' "$CONFIG_DIR/uris.txt" > "$CONFIG_DIR/new-links"
@@ -201,7 +201,7 @@ unknown_before=$(jq -c '{custom,outbounds,inbounds:[.inbounds[]|select(.type=="c
 
 # 一次新增 HY2，随机端口跳过未知 inbound 与 SS 占用端口，并保持旧配置不变。
 RANDOM_PORT_MODE=true
-action_manage_protocols <<< $'1 2\n\ny\n'
+action_manage_protocols <<< $'1 2\n\n\n\ny\n'
 RANDOM_PORT_MODE=false
 [ "$(<"$TMP_DIR/random-port-calls")" = 3 ] || { echo '随机端口选择未跳过已占用映射' >&2; exit 1; }
 new_ss_uri=$(jq -r '.inbounds[]|select(.type=="shadowsocks")|[.listen_port,.password,.method]|@tsv' "$CONFIG_DIR/config.json")
@@ -223,7 +223,7 @@ action_manage_protocols <<< $'1\ny\n'
 [ "$(grep '^ss://' "$CONFIG_DIR/uris.txt" | head -1)" = "$ss_uri_before" ]
 
 # 删除后重新添加必须生成新凭据。
-action_manage_protocols <<< $'1 2\n31002\ny\n'
+action_manage_protocols <<< $'1 2\n31002\n\n\ny\n'
 second_hy2_password="$(jq -r '.inbounds[]|select(.type=="hysteria2")|.users[0].password' "$CONFIG_DIR/config.json")"
 [ "$second_hy2_password" != "$first_hy2_password" ] || { echo '重新添加未生成新凭据' >&2; exit 1; }
 cert_hash_before=$(shasum -a 256 "$CONFIG_DIR/certs/fullchain.pem" | cut -d' ' -f1)
@@ -265,7 +265,7 @@ if validate_candidate_ports <(jq '.inbounds += [{type:"hysteria2",listen_port:20
 if validate_candidate_ports <(jq '.inbounds += [{type:"hysteria2",listen_port:24000}]' "$CONFIG_DIR/config.json") 2>/dev/null; then echo '应拒绝与未知 inbound 冲突的 UDP 端口' >&2; exit 1; fi
 if validate_candidate_ports <(jq '.inbounds += [{type:"vless",listen_port:24443,tls:{enabled:true,reality:{enabled:true}}}]' "$CONFIG_DIR/config.json") 2>/dev/null; then echo '应拒绝与非 Reality vless 冲突的 TCP 端口' >&2; exit 1; fi
 MOCK_CHECK_FAIL=true
-if action_manage_protocols <<< $'1 2\n31002\ny\n'; then echo '应拒绝校验失败的候选配置' >&2; exit 1; fi
+if action_manage_protocols <<< $'1 2\n31002\n\n\ny\n'; then echo '应拒绝校验失败的候选配置' >&2; exit 1; fi
 unset MOCK_CHECK_FAIL
 [ "$(shasum -a 256 "$CONFIG_DIR/config.json" | cut -d' ' -f1)" = "$config_before" ]
 [ "$(shasum -a 256 "$CONFIG_DIR/.protocols" | cut -d' ' -f1)" = "$protocols_before" ]
@@ -274,7 +274,7 @@ unset MOCK_CHECK_FAIL
 
 # 派生缓存提交写入失败时恢复已替换的配置、标记和共享材料。
 MV_FAIL_ONCE=true
-if action_manage_protocols <<< $'1 2\n31002\ny'; then echo '应处理缓存文件替换失败' >&2; exit 1; fi
+if action_manage_protocols <<< $'1 2\n31002\n\n\ny'; then echo '应处理缓存文件替换失败' >&2; exit 1; fi
 [ "$(shasum -a 256 "$CONFIG_DIR/config.json" | cut -d' ' -f1)" = "$config_before" ]
 [ "$(shasum -a 256 "$CONFIG_DIR/.protocols" | cut -d' ' -f1)" = "$protocols_before" ]
 [ "$(shasum -a 256 "$CONFIG_DIR/.config_cache" | cut -d' ' -f1)" = "$cache_before" ]
@@ -285,7 +285,7 @@ if action_manage_protocols <<< $'1 2\n31002\ny'; then echo '应处理缓存文�
 trap ':' INT TERM HUP
 trap -p INT TERM HUP RETURN > "$TMP_DIR/traps-before-failure"
 MOCK_RESTART_FAIL_AT=$(( ${SERVICE_CALLS:-0} + 1 ))
-if action_manage_protocols <<< $'1 2\n31002\ny\n'; then echo '应回滚失败的服务重启' >&2; exit 1; fi
+if action_manage_protocols <<< $'1 2\n31002\n\n\ny\n'; then echo '应回滚失败的服务重启' >&2; exit 1; fi
 unset MOCK_RESTART_FAIL_AT
 trap -p INT TERM HUP RETURN > "$TMP_DIR/traps-after-failure"
 cmp -s "$TMP_DIR/traps-before-failure" "$TMP_DIR/traps-after-failure" || { echo '常规事务失败后未恢复 signal/RETURN traps' >&2; exit 1; }
@@ -299,7 +299,7 @@ trap - INT TERM HUP
 SERVICE_CALLS=${SERVICE_CALLS:-0}
 MOCK_RESTART_FAIL_AT=$((SERVICE_CALLS + 1))
 MOCK_RESTART_FAIL_ALL=true
-if action_manage_protocols <<< $'1 2\n31002\ny'; then echo '恢复服务失败必须向调用方返回失败' >&2; exit 1; fi
+if action_manage_protocols <<< $'1 2\n31002\n\n\ny'; then echo '恢复服务失败必须向调用方返回失败' >&2; exit 1; fi
 unset MOCK_RESTART_FAIL_AT MOCK_RESTART_FAIL_ALL
 [ "$(shasum -a 256 "$CONFIG_DIR/config.json" | cut -d' ' -f1)" = "$config_before" ]
 [ "$(shasum -a 256 "$CONFIG_DIR/.protocols" | cut -d' ' -f1)" = "$protocols_before" ]
@@ -395,7 +395,7 @@ MOCK_RESTART_FAIL_AT=$((SERVICE_CALLS + 1))
 docker_compose() {
     [ "${1:-}" = up ] && grep -q 'old compose with custom extension' "$CONFIG_DIR/docker-compose.yml"
 }
-if action_manage_protocols <<< $'1 2\n31002\ny'; then echo 'Docker 新配置重启应失败并回滚' >&2; exit 1; fi
+if action_manage_protocols <<< $'1 2\n31002\n\n\ny'; then echo 'Docker 新配置重启应失败并回滚' >&2; exit 1; fi
 unset MOCK_RESTART_FAIL_AT MOCK_COMPOSE_MUTATE
 cmp -s "$TMP_DIR/compose-original" "$CONFIG_DIR/docker-compose.yml" || { echo 'Docker Compose 自定义内容未恢复' >&2; exit 1; }
 [ "$(jq '[.inbounds[]|select(.type=="hysteria2")]|length' "$CONFIG_PATH")" = 0 ] || { echo 'Docker 回滚未恢复原配置' >&2; exit 1; }

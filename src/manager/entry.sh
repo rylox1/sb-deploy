@@ -24,7 +24,7 @@ MENU
     fi
 
     if [ "${ENABLE_HY2:-false}" = "true" ]; then
-        echo "$option) 重置 HY2 端口"
+        echo "$option) 配置 HY2 端口、跳跃与拥塞控制"
         MENU_MAP[$option]="reset_hy2"
         option=$((option + 1))
     fi
@@ -103,7 +103,7 @@ while true; do
             action="${MENU_MAP[$opt]:-}"
             case "$action" in
                 reset_ss) action_reset_ss ;;
-                reset_hy2) action_reset_hy2 ;;
+                reset_hy2) action_configure_hy2 ;;
                 reset_tuic) action_reset_tuic ;;
                 reset_reality) action_reset_reality ;;
                 reset_anytls) action_reset_anytls ;;

@@ -7,6 +7,8 @@ read_config() {
     # 缓存仅提供非事实设置；协议状态始终由 config.json 推导。
     CUSTOM_IP=""
     LOG_ENABLED="false"
+    HY2_HOPPING_ENABLED=false; HY2_HOP_START=""; HY2_HOP_END=""; HY2_HOP_INTERVAL=15
+    HY2_BRUTAL_ENABLED=false; HY2_CLIENT_UP_MBPS=""; HY2_CLIENT_DOWN_MBPS=""; HY2_LEGACY_CONGESTION=false
     if [ -f "$CACHE_FILE" ]; then
         . "$CACHE_FILE"
     fi
@@ -48,6 +50,42 @@ read_config() {
     if [ "${ENABLE_HY2:-false}" = "true" ]; then
         HY2_PORT=$(jq -r '.inbounds[] | select(.type=="hysteria2") | .listen_port // empty' "$CONFIG_PATH") || return 1
         HY2_PSK=$(jq -r '.inbounds[] | select(.type=="hysteria2") | .users[0].password // empty' "$CONFIG_PATH") || return 1
+        HY2_HOPPING_ENABLED=${HY2_HOPPING_ENABLED:-false}
+        HY2_HOP_START=${HY2_HOP_START:-}
+        HY2_HOP_END=${HY2_HOP_END:-}
+        HY2_HOP_INTERVAL=${HY2_HOP_INTERVAL:-15}
+        case "$HY2_HOPPING_ENABLED" in
+            true)
+                validate_hy2_hopping_settings "$HY2_HOP_START" "$HY2_HOP_END" "$HY2_HOP_INTERVAL" "$HY2_PORT" || return 1
+                HY2_HOP_START=$((10#$HY2_HOP_START)); HY2_HOP_END=$((10#$HY2_HOP_END)); HY2_HOP_INTERVAL=$((10#$HY2_HOP_INTERVAL))
+                validate_hy2_port_conflicts "$CONFIG_PATH" "$HY2_HOP_START" "$HY2_HOP_END" || return 1
+                ;;
+            false) HY2_HOP_START=""; HY2_HOP_END="" ;;
+            *) err 'HY2_HOPPING_ENABLED 缓存值无效'; return 1 ;;
+        esac
+        [[ "$HY2_HOP_INTERVAL" =~ ^[0-9]+$ ]] || { err 'HY2_HOP_INTERVAL 缓存值无效'; return 1; }
+        HY2_HOP_INTERVAL=$((10#$HY2_HOP_INTERVAL))
+        (( HY2_HOP_INTERVAL >= 5 && HY2_HOP_INTERVAL <= 3600 )) || { err 'HY2_HOP_INTERVAL 缓存值无效'; return 1; }
+        HY2_BRUTAL_ENABLED=${HY2_BRUTAL_ENABLED:-false}
+        HY2_CLIENT_UP_MBPS=${HY2_CLIENT_UP_MBPS:-}
+        HY2_CLIENT_DOWN_MBPS=${HY2_CLIENT_DOWN_MBPS:-}
+        local hy2_up hy2_down hy2_ignore
+        hy2_up=$(jq -r '.inbounds[]|select(.type=="hysteria2")|.up_mbps // empty' "$CONFIG_PATH") || return 1
+        hy2_down=$(jq -r '.inbounds[]|select(.type=="hysteria2")|.down_mbps // empty' "$CONFIG_PATH") || return 1
+        hy2_ignore=$(jq -r '.inbounds[]|select(.type=="hysteria2")|.ignore_client_bandwidth // empty' "$CONFIG_PATH") || return 1
+        if [ -n "$hy2_up" ] && [ -n "$hy2_down" ] && [ "$hy2_ignore" = true ] && [[ "$hy2_up" =~ ^[1-9][0-9]*$ && "$hy2_down" =~ ^[1-9][0-9]*$ ]]; then
+            HY2_BRUTAL_ENABLED=true
+            HY2_CLIENT_UP_MBPS=$hy2_down
+            HY2_CLIENT_DOWN_MBPS=$hy2_up
+        elif [ -z "$hy2_up" ] && [ -z "$hy2_down" ] && [ "$hy2_ignore" = true ]; then
+            HY2_BRUTAL_ENABLED=false
+        elif [ -z "$hy2_up" ] && [ -z "$hy2_down" ] && [ -z "$hy2_ignore" ]; then
+            HY2_BRUTAL_ENABLED=false
+            HY2_LEGACY_CONGESTION=true
+        else
+            err 'HY2 拥塞控制配置非规范（ignore_client_bandwidth/up_mbps/down_mbps），拒绝自动修改'
+            return 1
+        fi
     fi
 
     if [ "${ENABLE_TUIC:-false}" = "true" ]; then
@@ -126,9 +164,33 @@ generate_uris() {
 
     if [ "${ENABLE_HY2:-false}" = "true" ]; then
         hy2_encoded=$(url_encode "$HY2_PSK")
-        echo "=== Hysteria2 (HY2) ===" >> "$uri_tmp" || { rm -f "$uri_tmp"; return 1; }
-        echo "hy2://${hy2_encoded}@${PUBLIC_IP}:${HY2_PORT}/?sni=www.bing.com&alpn=h3&insecure=1#hy2${node_suffix}" >> "$uri_tmp" || { rm -f "$uri_tmp"; return 1; }
-        echo "" >> "$uri_tmp" || { rm -f "$uri_tmp"; return 1; }
+        local hy2_fragment hy2_host="$PUBLIC_IP" hy2_authority_port="$HY2_PORT" hy2_mihomo_query=''
+        hy2_fragment=$(url_encode "hy2${node_suffix}") || { rm -f "$uri_tmp"; return 1; }
+        [[ "$hy2_host" == *:* && "$hy2_host" != \[*\] ]] && hy2_host="[$hy2_host]"
+        if [ "$HY2_HOPPING_ENABLED" = true ]; then
+            hy2_authority_port="$HY2_HOP_START-$HY2_HOP_END"
+            hy2_mihomo_query="&hop-interval=$HY2_HOP_INTERVAL"
+        fi
+        if [ "$HY2_BRUTAL_ENABLED" = true ]; then
+            hy2_mihomo_query+="&up=$HY2_CLIENT_UP_MBPS&down=$HY2_CLIENT_DOWN_MBPS"
+        fi
+        if [ "${HY2_LEGACY_CONGESTION:-false}" = true ]; then
+            echo '提示：旧版 HY2 服务端尚未强制 BBR；进入“配置 HY2”并确认设置后才会规范化。' >> "$uri_tmp" || { rm -f "$uri_tmp"; return 1; }
+        fi
+        echo '=== Hysteria2 标准 URI（通用） ===' >> "$uri_tmp" || { rm -f "$uri_tmp"; return 1; }
+        echo "hy2://${hy2_encoded}@${hy2_host}:${hy2_authority_port}/?sni=www.bing.com&alpn=h3&insecure=1#${hy2_fragment}" >> "$uri_tmp" || { rm -f "$uri_tmp"; return 1; }
+        echo '' >> "$uri_tmp" || { rm -f "$uri_tmp"; return 1; }
+        echo '=== Hysteria2 Shadowrocket URI ===' >> "$uri_tmp" || { rm -f "$uri_tmp"; return 1; }
+        local shadow_query=''
+        [ "$HY2_HOPPING_ENABLED" = true ] && shadow_query="mport=$HY2_HOP_START-$HY2_HOP_END&"
+        echo "hy2://${hy2_encoded}@${hy2_host}:${HY2_PORT}/?${shadow_query}sni=www.bing.com&alpn=h3&insecure=1#${hy2_fragment}" >> "$uri_tmp" || { rm -f "$uri_tmp"; return 1; }
+        if [ "$HY2_HOPPING_ENABLED" = true ] || [ "$HY2_BRUTAL_ENABLED" = true ]; then
+            echo '提示：Shadowrocket 请手动核对端口跳跃和/或 Brutal 上下行速率设置。' >> "$uri_tmp" || { rm -f "$uri_tmp"; return 1; }
+        fi
+        echo '' >> "$uri_tmp" || { rm -f "$uri_tmp"; return 1; }
+        echo '=== Hysteria2 Mihomo / mihomo-kit 扩展 URI（非官方扩展） ===' >> "$uri_tmp" || { rm -f "$uri_tmp"; return 1; }
+        echo "hy2://${hy2_encoded}@${hy2_host}:${hy2_authority_port}/?sni=www.bing.com&alpn=h3&insecure=1${hy2_mihomo_query}#${hy2_fragment}" >> "$uri_tmp" || { rm -f "$uri_tmp"; return 1; }
+        echo '' >> "$uri_tmp" || { rm -f "$uri_tmp"; return 1; }
     fi
 
     if [ "${ENABLE_TUIC:-false}" = "true" ]; then

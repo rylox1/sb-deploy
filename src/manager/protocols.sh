@@ -1,3 +1,33 @@
+HY2_HOP_PORT_MIN=2
+HY2_HOP_PORT_MAX=100
+HY2_HOP_INTERVAL_MIN=5
+HY2_HOP_INTERVAL_MAX=3600
+
+validate_hy2_hopping_settings() {
+    local start="$1" end="$2" interval="$3" listen_port="${4:-$1}" count
+    [[ "$start" =~ ^[0-9]{1,5}$ && "$end" =~ ^[0-9]{1,5}$ && "$interval" =~ ^[0-9]{1,4}$ ]] || { err 'HY2 跳跃范围和间隔必须为整数'; return 1; }
+    start=$((10#$start)); end=$((10#$end)); interval=$((10#$interval)); listen_port=$((10#$listen_port))
+    count=$((end-start+1))
+    (( start >= 1 && end <= 65535 && start < end && count >= HY2_HOP_PORT_MIN && count <= HY2_HOP_PORT_MAX )) || { err 'HY2 跳跃范围必须为 1-65535 内连续 2-100 个端口'; return 1; }
+    (( interval >= HY2_HOP_INTERVAL_MIN && interval <= HY2_HOP_INTERVAL_MAX )) || { err 'HY2 跳跃间隔必须为 5-3600 秒'; return 1; }
+    (( listen_port == start )) || { err 'HY2 监听端口必须等于跳跃范围首端'; return 1; }
+}
+
+validate_hy2_port_conflicts() {
+    local config="$1" start="$2" end="$3"
+    jq -e --argjson start "$start" --argjson end "$end" '
+      [.inbounds[]? | select(.listen_port|type=="number") | {type,port:.listen_port,reality:(.tls.reality.enabled==true)}] as $all |
+      all($all[]; . as $item |
+        (if $item.type=="shadowsocks" then ["tcp","udp"]
+         elif $item.type=="hysteria2" or $item.type=="tuic" then ["udp"]
+         elif ($item.type=="vless" or $item.type=="anytls") and $item.reality then ["tcp"]
+         else ["tcp","udp"] end) as $transports |
+        if $item.type=="hysteria2" then $item.port==$start
+        else ((any($transports[]; . == "udp") and $item.port >= $start and $item.port <= $end) | not) end
+      )
+    ' "$config" >/dev/null || { err 'HY2 UDP 范围与现有 inbound 端口冲突'; return 1; }
+}
+
 protocol_key() {
     case "$1" in
         1) echo ss ;; 2) echo hy2 ;; 3) echo tuic ;; 4) echo reality ;; 5) echo anytls ;;
@@ -54,7 +84,23 @@ render_protocol_state() {
                 value=$(jq -er '.inbounds[]|select(.type=="hysteria2")|.listen_port' "$config") || return 1
                 state_write_raw "$cache_out" HY2_PORT "$value" || return 1
                 value=$(jq -er '.inbounds[]|select(.type=="hysteria2")|.users[0].password' "$config") || return 1
-                state_write_shell "$cache_out" HY2_PSK "$value" || return 1 ;;
+                state_write_shell "$cache_out" HY2_PSK "$value" || return 1
+                state_write_shell "$cache_out" HY2_HOPPING_ENABLED "${HY2_HOPPING_ENABLED:-false}" || return 1
+                state_write_shell "$cache_out" HY2_HOP_START "${HY2_HOP_START:-}" || return 1
+                state_write_shell "$cache_out" HY2_HOP_END "${HY2_HOP_END:-}" || return 1
+                state_write_shell "$cache_out" HY2_HOP_INTERVAL "${HY2_HOP_INTERVAL:-15}" || return 1
+                local congestion_state server_up server_down client_up client_down
+                server_up=$(jq -er '.inbounds[]|select(.type=="hysteria2")|.up_mbps // empty' "$config" 2>/dev/null || true)
+                server_down=$(jq -er '.inbounds[]|select(.type=="hysteria2")|.down_mbps // empty' "$config" 2>/dev/null || true)
+                if [ -n "$server_up" ] && [ -n "$server_down" ]; then
+                    client_up=$server_down; client_down=$server_up
+                    congestion_state=true
+                else
+                    client_up=""; client_down=""; congestion_state=false
+                fi
+                state_write_shell "$cache_out" HY2_BRUTAL_ENABLED "$congestion_state" || return 1
+                state_write_shell "$cache_out" HY2_CLIENT_UP_MBPS "$client_up" || return 1
+                state_write_shell "$cache_out" HY2_CLIENT_DOWN_MBPS "$client_down" || return 1 ;;
             tuic)
                 value=$(jq -er '.inbounds[]|select(.type=="tuic")|.listen_port' "$config") || return 1
                 state_write_raw "$cache_out" TUIC_PORT "$value" || return 1
@@ -79,7 +125,8 @@ render_protocol_state() {
             state_write_shell "$cache_out" "$name" "$value" || { err "写入候选 Reality 字段失败: $name"; return 1; }
         done
         public_key_file="$CONFIG_DIR/.reality_pub"
-        [ -f "$TX_DIR/material/.reality_pub" ] && public_key_file="$TX_DIR/material/.reality_pub"
+        local candidate_public_key="${TX_DIR:-}/material/.reality_pub"
+        [ -n "${TX_DIR:-}" ] && [ -f "$candidate_public_key" ] && public_key_file="$candidate_public_key"
         if [ -f "$public_key_file" ]; then value=$(<"$public_key_file") || return 1; state_write_shell "$cache_out" REALITY_PUB "$value" || return 1; fi
     fi
 }
@@ -92,6 +139,12 @@ protocol_port_free() {
          (((.type=="vless" or .type=="anytls") and .tls.reality.enabled==true) | not))] | length>0
     ' "$CONFIG_PATH" >/dev/null; then
         return 1
+    fi
+    # 跳跃范围内的 UDP 端口也属于 HY2 的占用范围，随机分配时必须跳过。
+    if [ "${HY2_HOPPING_ENABLED:-false}" = true ] && [[ "$target" =~ ^(ss|hy2|tuic)$ ]]; then
+        local hop_start hop_end
+        hop_start=$((10#${HY2_HOP_START:-0})); hop_end=$((10#${HY2_HOP_END:-0}))
+        if (( candidate >= hop_start && candidate <= hop_end )); then return 1; fi
     fi
     for key in ss hy2 tuic reality anytls; do
         [ "$key" = "$target" ] && continue
@@ -121,11 +174,60 @@ protocol_port_free() {
     return 0
 }
 
+collect_hy2_settings() {
+    local port="$1" choice range interval up down
+    local old_hopping="${HY2_HOPPING_ENABLED:-false}" old_start="${HY2_HOP_START:-}" old_end="${HY2_HOP_END:-}" old_interval="${HY2_HOP_INTERVAL:-15}"
+    local old_brutal="${HY2_BRUTAL_ENABLED:-false}" old_up="${HY2_CLIENT_UP_MBPS:-}" old_down="${HY2_CLIENT_DOWN_MBPS:-}"
+    HY2_PORT="$port"
+    HY2_HOPPING_ENABLED=false; HY2_HOP_START=""; HY2_HOP_END=""; HY2_HOP_INTERVAL=15
+    local hop_default=N brutal_default=N
+    [ "$old_hopping" = true ] && hop_default=Y
+    read -r -p "启用 HY2 UDP 端口跳跃？[y/N，当前 ${old_hopping}] " choice || choice=
+    if [ -z "$choice" ]; then choice=$hop_default; fi
+    if [[ "$choice" =~ ^[Yy]$ ]]; then
+        range="$old_start-$old_end"
+        read -r -p "输入连续端口范围 start-end（监听端口必须为首端）[$range]: " interval || interval=
+        range=${interval:-$range}
+        if [[ "$range" =~ ^([0-9]{1,5})-([0-9]{1,5})$ ]]; then
+            HY2_HOP_START=$((10#${BASH_REMATCH[1]})); HY2_HOP_END=$((10#${BASH_REMATCH[2]}))
+        else
+            err 'HY2 跳跃范围格式无效'; return 1
+        fi
+        interval=$old_interval
+        read -r -p "跳跃间隔秒数 [${old_interval}]（5-3600）: " up || up=
+        HY2_HOP_INTERVAL=${up:-$interval}
+        validate_hy2_hopping_settings "$HY2_HOP_START" "$HY2_HOP_END" "$HY2_HOP_INTERVAL" "$port" || return 1
+        HY2_HOP_INTERVAL=$((10#$HY2_HOP_INTERVAL))
+        HY2_HOPPING_ENABLED=true
+        HY2_PORT=$HY2_HOP_START
+    fi
+    [ "$old_brutal" = true ] && brutal_default=Y
+    read -r -p "启用 Brutal 拥塞控制？[y/N，当前 ${old_brutal}] " choice || choice=
+    [ -n "$choice" ] || choice=$brutal_default
+    HY2_BRUTAL_ENABLED=false; HY2_CLIENT_UP_MBPS=""; HY2_CLIENT_DOWN_MBPS=""
+    if [[ "$choice" =~ ^[Yy]$ ]]; then
+        read -r -p "客户端上行 Mbps [${old_up}]: " up || up=
+        read -r -p "客户端下行 Mbps [${old_down}]: " down || down=
+        up=${up:-$old_up}; down=${down:-$old_down}
+        [[ "$up" =~ ^[1-9][0-9]*$ && "$down" =~ ^[1-9][0-9]*$ ]] || { err 'Brutal 上下行速率必须为正整数'; return 1; }
+        HY2_BRUTAL_ENABLED=true; HY2_CLIENT_UP_MBPS=$up; HY2_CLIENT_DOWN_MBPS=$down
+    fi
+}
+
 collect_protocol_inbound() {
     local key="$1" port="$2" method="" pass="" uuid="" user="" sni="${REALITY_SNI:-addons.mozilla.org}" pk="${REALITY_PK:-}" sid="${REALITY_SID:-}"
     case "$key" in
         ss) read -r -p 'SS 加密方式 [1=2022-blake3-aes-128-gcm, 2=aes-128-gcm，默认 1]: ' choice || choice=; method=2022-blake3-aes-128-gcm; [ "$choice" = 2 ] && method=aes-128-gcm; pass=$(rand_pass); jq -n --argjson port "$port" --arg method "$method" --arg pass "$pass" '{type:"shadowsocks",listen:"::",listen_port:$port,method:$method,password:$pass,tag:"ss-in"}' > "$TX_DIR/$key.json" ;;
-        hy2) pass=$(rand_pass); jq -n --argjson port "$port" --arg pass "$pass" '{type:"hysteria2",tag:"hy2-in",listen:"::",listen_port:$port,users:[{password:$pass}],tls:{enabled:true,alpn:["h3"],certificate_path:"/etc/sing-box/certs/fullchain.pem",key_path:"/etc/sing-box/certs/privkey.pem"}}' > "$TX_DIR/$key.json" ;;
+        hy2)
+            collect_hy2_settings "$port" || return 1
+            validate_hy2_runtime_prerequisites || return 1
+            port="$HY2_PORT"
+            pass=$(rand_pass)
+            jq -n --argjson port "$port" --arg pass "$pass" --argjson brutal "$HY2_BRUTAL_ENABLED" --argjson client_up "${HY2_CLIENT_UP_MBPS:-0}" --argjson client_down "${HY2_CLIENT_DOWN_MBPS:-0}" '
+              {type:"hysteria2",tag:"hy2-in",listen:"::",listen_port:$port,ignore_client_bandwidth:true,users:[{password:$pass}],tls:{enabled:true,alpn:["h3"],certificate_path:"/etc/sing-box/certs/fullchain.pem",key_path:"/etc/sing-box/certs/privkey.pem"}}
+              | if $brutal then . + {up_mbps:$client_down,down_mbps:$client_up} else . end
+            ' > "$TX_DIR/$key.json" || return 1
+            ;;
         tuic) pass=$(rand_pass); uuid=$(rand_uuid); jq -n --argjson port "$port" --arg pass "$pass" --arg uuid "$uuid" '{type:"tuic",tag:"tuic-in",listen:"::",listen_port:$port,users:[{uuid:$uuid,password:$pass}],congestion_control:"bbr",tls:{enabled:true,alpn:["h3"],certificate_path:"/etc/sing-box/certs/fullchain.pem",key_path:"/etc/sing-box/certs/privkey.pem"}}' > "$TX_DIR/$key.json" ;;
         reality) uuid=$(rand_uuid); jq -n --argjson port "$port" --arg uuid "$uuid" --arg sni "$sni" --arg pk "$pk" --arg sid "$sid" '{type:"vless",tag:"vless-in",listen:"::",listen_port:$port,users:[{uuid:$uuid,flow:"xtls-rprx-vision"}],tls:{enabled:true,server_name:$sni,reality:{enabled:true,handshake:{server:$sni,server_port:443},private_key:$pk,short_id:[$sid]}}}' > "$TX_DIR/$key.json" ;;
         anytls) user=$(openssl rand -hex 4); pass=$(rand_pass); jq -n --argjson port "$port" --arg user "$user" --arg pass "$pass" --arg sni "$sni" --arg pk "$pk" --arg sid "$sid" '{type:"anytls",tag:"anytls-in",listen:"::",listen_port:$port,users:[{name:$user,password:$pass}],padding_scheme:[],tls:{enabled:true,server_name:$sni,reality:{enabled:true,handshake:{server:$sni,server_port:443},private_key:$pk,short_id:[$sid]}}}' > "$TX_DIR/$key.json" ;;
@@ -171,21 +273,58 @@ apply_protocol_transaction() {
     saved_int_trap=$(trap -p INT); saved_term_trap=$(trap -p TERM); saved_hup_trap=$(trap -p HUP)
     local snapshot="$TX_DIR/backup"; mkdir -m 700 "$snapshot" || return 1
     local rollback_active=false
-    for file in config.json .protocols .config_cache uris.txt .reality_pub .reality_sid certs/fullchain.pem certs/privkey.pem docker-compose.yml; do
+    for file in config.json .protocols .config_cache uris.txt .reality_pub .reality_sid certs/fullchain.pem certs/privkey.pem docker-compose.yml hy2-port-hopping.sh; do
         if [ -e "$CONFIG_DIR/$file" ]; then mkdir -p "$snapshot/$(dirname "$file")" || return 1; cp -p "$CONFIG_DIR/$file" "$snapshot/$file" || return 1; touch "$snapshot/$file.present" || return 1; fi
     done
+    local hopping_service_file=""
+    if [ "$DEPLOY_MODE" = host ]; then
+        hopping_service_file=$(hy2_hopping_service_file) || return 1
+        if [ -e "$hopping_service_file" ]; then
+            cp -p "$hopping_service_file" "$snapshot/hopping-service" || return 1
+            touch "$snapshot/hopping-service.present" || return 1
+        fi
+    fi
     rollback_protocol_transaction() {
         local path restore_ok=true service_ok=false
         [ "$rollback_active" = true ] || return 0
         rollback_active=false
         rm -f "$CONFIG_DIR/config.json.tmp.$$" "$CONFIG_DIR/.protocols.tmp.$$" "$CONFIG_DIR/.config_cache.tmp.$$" "$CONFIG_DIR/uris.txt.tmp.$$" || restore_ok=false
-        for path in config.json .protocols .config_cache uris.txt .reality_pub .reality_sid certs/fullchain.pem certs/privkey.pem docker-compose.yml; do
+        for path in config.json .protocols .config_cache uris.txt .reality_pub .reality_sid certs/fullchain.pem certs/privkey.pem docker-compose.yml hy2-port-hopping.sh; do
             if [ -f "$snapshot/$path.present" ]; then
                 mkdir -p "$CONFIG_DIR/$(dirname "$path")" && cp -p "$snapshot/$path" "$CONFIG_DIR/$path" || restore_ok=false
             else
                 rm -f "$CONFIG_DIR/$path" || restore_ok=false
             fi
         done
+        if [ "$DEPLOY_MODE" = host ]; then
+            if [ -f "$snapshot/hopping-service.present" ]; then
+                if mkdir -p "$(dirname "$hopping_service_file")" && cp -p "$snapshot/hopping-service" "$hopping_service_file"; then
+                    if [ "$OS" = alpine ]; then
+                        rc-update add sb-deploy-hy2-hopping default >/dev/null 2>&1 || restore_ok=false
+                    elif systemctl daemon-reload >/dev/null 2>&1 && systemctl enable sb-deploy-hy2-hopping.service >/dev/null 2>&1; then
+                        :
+                    else
+                        restore_ok=false
+                    fi
+                else
+                    restore_ok=false
+                fi
+            else
+                if [ -e "$hopping_service_file" ]; then
+                    if [ "$OS" = alpine ]; then
+                        rc-service sb-deploy-hy2-hopping stop >/dev/null 2>&1 || restore_ok=false
+                        rc-update del sb-deploy-hy2-hopping default >/dev/null 2>&1 || restore_ok=false
+                    else
+                        systemctl disable --now sb-deploy-hy2-hopping.service >/dev/null 2>&1 || restore_ok=false
+                    fi
+                fi
+                rm -f "$hopping_service_file" || restore_ok=false
+                if [ "$OS" != alpine ] && command -v systemctl >/dev/null 2>&1; then
+                    systemctl daemon-reload >/dev/null 2>&1 || restore_ok=false
+                fi
+            fi
+        fi
+        if [ "$DEPLOY_MODE" = host ] && [ ! -x "$CONFIG_DIR/hy2-port-hopping.sh" ] && command -v nft >/dev/null 2>&1; then nft delete table inet sb_deploy_hy2 >/dev/null 2>&1 || true; fi
         if [ "$DEPLOY_MODE" = docker ]; then
             docker_compose up -d --force-recreate && service_ok=true
         else
@@ -225,6 +364,11 @@ apply_protocol_transaction() {
         src=${item%%:*}; dst=${item#*:}; tmp="$dst.tmp.$$"
         cp "$src" "$tmp" && mv "$tmp" "$dst" || { rollback_protocol_transaction; protocol_transaction_restore_signal_traps; return 1; }
     done
+    if [ "$DEPLOY_MODE" = host ] && jq -e '[.inbounds[]?|select(.type=="hysteria2")]|length>0' "$candidate" >/dev/null && [ "${HY2_HOPPING_ENABLED:-false}" = true ]; then
+        ensure_hy2_hopping_runtime || { err 'HY2 nftables 规则应用失败，正在回滚'; rollback_protocol_transaction; protocol_transaction_restore_signal_traps; return 1; }
+    elif [ "$DEPLOY_MODE" = host ] && [ -x "$CONFIG_DIR/hy2-port-hopping.sh" ]; then
+        "$CONFIG_DIR/hy2-port-hopping.sh" clear || { err 'HY2 nftables 规则清理失败，正在回滚'; rollback_protocol_transaction; protocol_transaction_restore_signal_traps; return 1; }
+    fi
     service_restart || { err '新配置服务重启失败，正在回滚'; rollback_protocol_transaction; protocol_transaction_restore_signal_traps; return 1; }
     generate_uris || { err '链接重建失败，正在回滚'; rollback_protocol_transaction; protocol_transaction_restore_signal_traps; return 1; }
     if ! jq -e '[.inbounds[]?|select((.type=="vless" or .type=="anytls") and .tls.reality.enabled==true)]|length>0' "$CONFIG_DIR/config.json" >/dev/null; then
@@ -232,6 +376,9 @@ apply_protocol_transaction() {
     fi
     if ! jq -e '[.inbounds[]?|select(.type=="hysteria2" or .type=="tuic")]|length>0' "$CONFIG_DIR/config.json" >/dev/null; then
         rm -f "$CONFIG_DIR/certs/fullchain.pem" "$CONFIG_DIR/certs/privkey.pem" || { err '清理已撤销证书失败'; rollback_protocol_transaction; protocol_transaction_restore_signal_traps; return 1; }
+    fi
+    if [ "$DEPLOY_MODE" = host ] && ! jq -e '[.inbounds[]?|select(.type=="hysteria2")]|length>0' "$CONFIG_DIR/config.json" >/dev/null && [ -x "$CONFIG_DIR/hy2-port-hopping.sh" ]; then
+        clear_hy2_hopping_runtime || { err '清理 HY2 nftables 服务失败，正在回滚'; rollback_protocol_transaction; protocol_transaction_restore_signal_traps; return 1; }
     fi
     [ -f "$CONFIG_DIR/.protocols" ] || { rollback_protocol_transaction; protocol_transaction_restore_signal_traps; return 1; }
     rollback_active=false
@@ -258,6 +405,7 @@ action_manage_protocols_impl() {
         if [ "${requested[$i]:-}" = 1 ]; then [ "$enabled" = true ] && unchanged+="$key " || added+="$key "; else [ "$enabled" = true ] && removed+="$key "; fi
     done
     if [ -z "$added$removed" ]; then info '协议集合没有变化，无需调整'; return 0; fi
+    validate_hy2_runtime_prerequisites "${HY2_HOPPING_ENABLED:-false}" || return 1
     TX_DIR=$(mktemp -d "$CONFIG_DIR/.protocol-update.XXXXXX") || return 1
     chmod 700 "$TX_DIR" && mkdir "$TX_DIR/material" || { rm -rf "$TX_DIR"; TX_DIR=""; return 1; }
     local reality_retained=false cert_retained=false
@@ -304,6 +452,12 @@ action_manage_protocols_impl() {
     for key in $added; do candidate_tmp="$TX_DIR/step-$key.json"; jq --slurpfile inbound "$TX_DIR/$key.json" '.inbounds += $inbound' "$candidate" > "$candidate_tmp" || return 1; mv "$candidate_tmp" "$candidate"; done
     for key in $removed; do type=$(protocol_type "$key"); candidate_tmp="$TX_DIR/remove-$key.json"; selector=$(protocol_selector "$key"); jq " .inbounds |= map(select((($selector) | not))) " "$candidate" > "$candidate_tmp" || return 1; mv "$candidate_tmp" "$candidate"; done
     validate_candidate_ports "$candidate" || return 1
+    if jq -e '[.inbounds[]?|select(.type=="hysteria2")]|length>0' "$candidate" >/dev/null; then
+        if [ "${HY2_HOPPING_ENABLED:-false}" = true ]; then
+            validate_hy2_hopping_settings "$HY2_HOP_START" "$HY2_HOP_END" "$HY2_HOP_INTERVAL" "$(jq -r '.inbounds[]|select(.type=="hysteria2")|.listen_port' "$candidate")" || return 1
+            validate_hy2_port_conflicts "$candidate" "$HY2_HOP_START" "$HY2_HOP_END" || return 1
+        fi
+    fi
     render_protocol_state "$candidate" "$TX_DIR/protocols" "$TX_DIR/cache" || { err '候选协议状态生成失败，未修改节点配置'; return 1; }
     echo "将新增：${added:-无}"; echo "将删除：${removed:-无}"; echo "保持不变：${unchanged:-无}"
     read -r -p '确认应用以上变更？[y/N] ' confirm || confirm=

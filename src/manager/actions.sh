@@ -63,33 +63,49 @@ action_reset_ss() {
     generate_uris || warn "生成 URI 失败"
 }
 
-# 重置HY2端口
-action_reset_hy2() {
+# 配置 HY2 端口跳跃与拥塞控制
+action_configure_hy2() {
     read_config || return 1
-
-    if [ "${ENABLE_HY2:-false}" != "true" ]; then
-        err "HY2 协议未启用"
+    [ "${ENABLE_HY2:-false}" = true ] || { err 'HY2 协议未启用'; return 1; }
+    local new_port candidate previous_hopping="${HY2_HOPPING_ENABLED:-false}"
+    read -r -p "输入 HY2 固定端口或跳跃范围首端（回车保持 ${HY2_PORT}）:" new_port || new_port=
+    new_port=${new_port:-$HY2_PORT}
+    validate_port "$new_port" || return 1
+    collect_hy2_settings "$new_port" || return 1
+    validate_hy2_runtime_prerequisites "$previous_hopping" || return 1
+    candidate=$(mktemp "$CONFIG_DIR/.hy2-configure.XXXXXX") || return 1
+    jq --argjson port "$HY2_PORT" --argjson brutal "$HY2_BRUTAL_ENABLED" --argjson up "${HY2_CLIENT_DOWN_MBPS:-0}" --argjson down "${HY2_CLIENT_UP_MBPS:-0}" '
+      .inbounds |= map(if .type=="hysteria2" then
+        .listen_port=$port | .ignore_client_bandwidth=true |
+        (if $brutal then .up_mbps=$up | .down_mbps=$down else del(.up_mbps,.down_mbps) end)
+        else . end)
+    ' "$CONFIG_PATH" > "$candidate" || { rm -f "$candidate"; return 1; }
+    validate_candidate_ports "$candidate" || { rm -f "$candidate"; return 1; }
+    if [ "$HY2_HOPPING_ENABLED" = true ]; then
+        validate_hy2_hopping_settings "$HY2_HOP_START" "$HY2_HOP_END" "$HY2_HOP_INTERVAL" "$HY2_PORT" || { rm -f "$candidate"; return 1; }
+        validate_hy2_port_conflicts "$candidate" "$HY2_HOP_START" "$HY2_HOP_END" || { rm -f "$candidate"; return 1; }
+    fi
+    local protocol_candidate="$CONFIG_DIR/.hy2-protocols.$$" cache_candidate="$CONFIG_DIR/.hy2-cache.$$"
+    render_protocol_state "$candidate" "$protocol_candidate" "$cache_candidate" || { rm -f "$candidate" "$protocol_candidate" "$cache_candidate"; return 1; }
+    echo "HY2 监听端口: ${HY2_PORT}"
+    if [ "$HY2_HOPPING_ENABLED" = true ]; then echo "UDP 跳跃范围: ${HY2_HOP_START}-${HY2_HOP_END}，间隔 ${HY2_HOP_INTERVAL} 秒（防火墙及云安全组需放行完整范围）"; else echo 'UDP 跳跃: 关闭'; fi
+    if [ "$HY2_BRUTAL_ENABLED" = true ]; then echo "Brutal: 客户端上行 ${HY2_CLIENT_UP_MBPS} Mbps / 下行 ${HY2_CLIENT_DOWN_MBPS} Mbps"; else echo '拥塞控制: BBR（服务端强制）'; fi
+    read -r -p '确认应用 HY2 设置？[y/N] ' confirm || confirm=
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then rm -f "$candidate" "$protocol_candidate" "$cache_candidate"; info '已取消，未修改节点配置'; return 0; fi
+    TX_DIR=$(mktemp -d "$CONFIG_DIR/.protocol-update.XXXXXX") || return 1
+    chmod 700 "$TX_DIR" && mkdir "$TX_DIR/material" || { rm -rf "$TX_DIR"; TX_DIR=; return 1; }
+    cp "$candidate" "$TX_DIR/candidate.json" && cp "$protocol_candidate" "$TX_DIR/protocols" && cp "$cache_candidate" "$TX_DIR/cache" || { rm -f "$candidate" "$protocol_candidate" "$cache_candidate"; rm -rf "$TX_DIR"; TX_DIR=; return 1; }
+    rm -f "$candidate" "$protocol_candidate" "$cache_candidate"
+    if ! apply_protocol_transaction "$TX_DIR/candidate.json" "$TX_DIR/protocols" "$TX_DIR/cache" "$TX_DIR/uri-backup"; then
+        rm -rf "$TX_DIR"; TX_DIR=
         return 1
     fi
-
-    read -p "输入新的 HY2 端口(回车保持 $HY2_PORT): " new_port
-    new_port="${new_port:-$HY2_PORT}"
-    validate_port "$new_port" || return 1
-
-    info "正在停止服务..."
-    service_stop || warn "停止服务失败"
-
-    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
-
-    jq --argjson port "$new_port" '
-    .inbounds |= map(if .type=="hysteria2" then .listen_port = $port else . end)
-    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
-
-    info "已启动服务并更新 HY2 端口: $new_port"
-    service_start || warn "启动服务失败"
-    sleep 1
-    generate_uris || warn "生成 URI 失败"
+    rm -rf "$TX_DIR"; TX_DIR=
+    read_config || return 1
+    info 'HY2 设置已更新'
 }
+
+action_reset_hy2() { action_configure_hy2 "$@"; }
 
 # 重置TUIC端口
 action_reset_tuic() {
@@ -207,6 +223,9 @@ action_uninstall() {
     [[ ! "$confirm" =~ ^[Yy]$ ]] && info "已取消" && return 0
 
     info "正在卸载..."
+    if [ "$DEPLOY_MODE" = host ] && [ -x "$CONFIG_DIR/hy2-port-hopping.sh" ]; then
+        clear_hy2_hopping_runtime || { err '无法清理 HY2 专属 nftables 规则；保留配置以便重试'; return 1; }
+    fi
     service_stop || true
     if [ "$DEPLOY_MODE" = "docker" ]; then
         if ! docker_compose down; then

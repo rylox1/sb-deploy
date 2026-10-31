@@ -13,6 +13,7 @@ declare -A published_ports=()
 add_port() {
     local port="$1"
     local transport="$2"
+    local container_port="${3:-$port}"
     local key="$port/$transport"
 
     if [[ -n "${published_ports[$key]:-}" ]]; then
@@ -20,8 +21,17 @@ add_port() {
         return 1
     fi
     published_ports[$key]=1
-    printf '      - "%s:%s/%s"\n' "$port" "$port" "$transport" >> "$PORTS_PATH"
+    printf '      - "%s:%s/%s"\n' "$port" "$container_port" "$transport" >> "$PORTS_PATH"
 }
+
+cache_value() {
+    local key="$1"
+    awk -F= -v key="$key" '$1 == key {sub(/^[^=]*=/, ""); print; exit}' "$CONFIG_DIR/.config_cache" 2>/dev/null || true
+}
+
+HY2_HOPPING_ENABLED=$(cache_value HY2_HOPPING_ENABLED)
+HY2_HOP_START=$(cache_value HY2_HOP_START)
+HY2_HOP_END=$(cache_value HY2_HOP_END)
 
 while IFS=$'\t' read -r inbound_type port; do
     [ -n "$inbound_type" ] || continue
@@ -35,7 +45,24 @@ while IFS=$'\t' read -r inbound_type port; do
             add_port "$port" tcp
             add_port "$port" udp
             ;;
-        hysteria2|tuic)
+        hysteria2)
+            if [ "$HY2_HOPPING_ENABLED" = true ]; then
+                if [[ ! "$HY2_HOP_START" =~ ^[0-9]{1,5}$ || ! "$HY2_HOP_END" =~ ^[0-9]{1,5}$ ]]; then
+                    printf '[ERR] HY2 跳跃范围缓存无效\n' >&2
+                    exit 1
+                fi
+                local_start=$((10#$HY2_HOP_START)); local_end=$((10#$HY2_HOP_END))
+                local_count=$((local_end - local_start + 1))
+                if (( local_start < 1 || local_end > 65535 || local_start != 10#$port || local_count < 2 || local_count > 100 )); then
+                    printf '[ERR] HY2 跳跃范围与监听端口不一致或范围无效\n' >&2
+                    exit 1
+                fi
+                for ((hop_port=local_start; hop_port<=local_end; hop_port++)); do add_port "$hop_port" udp "$port"; done
+            else
+                add_port "$port" udp
+            fi
+            ;;
+        tuic)
             add_port "$port" udp
             ;;
         vless|anytls)
